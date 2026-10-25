@@ -1,0 +1,19 @@
+* { box-sizing: border-box; }
+
+:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; background: #0c0f12; color: #edf1ef; }
+
+body { min-width: 360px; min-height: 100vh; margin: 0; padding: 48px 20px; background: radial-gradient(ellipse 70% 55% at 50% -12%, rgba(90, 139, 120, .15), transparent 70%), #0c0f12; }
+
+.settings-card { width: min(100%, 540px); margin: 0 auto; padding: 32px; border: 1px solid rgba(255,255,255,.09); border-radius: 20px; background: rgba(255,255,255,.035); }
+.brand { display: flex; align-items: center; gap: 10px; color: #eef3f0; font-size: 15px; font-weight: 650; letter-spacing: -.3px; }
+.coin { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; background: rgba(140,231,198,.1); color: #e4c780; font-size: 19px; }
+.eyebrow { margin: 38px 0 8px; color: #80ba9d; font-size: 9px; font-weight: 700; letter-spacing: 1.3px; }
+h1 { margin: 0; color: #f2f5f3; font-size: 27px; font-weight: 580; letter-spacing: -1px; }
+.description { margin: 10px 0 25px; color: #939da1; font-size: 13px; line-height: 1.65; }
+.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 17px 0; border-top: 1px solid rgba(255,255,255,.07); border-bottom: 1px solid rgba(255,255,255,.07); cursor: pointer; }
+.setting-row span { display: flex; flex-direction: column; gap: 5px; }
+.setting-row strong { color: #e5ebe8; font-size: 13px; font-weight: 570; }
+.setting-row small { color: #7c878b; font-size: 11px; }
+input[type="checkbox"] { width: 38px; height: 21px; flex: 0 0 auto; margin: 0; accent-color: #8ce7c6; cursor: pointer; }
+.status { min-height: 16px; margin: 12px 0 0; color: #91d7b7; font-size: 11px; }
+.note { margin: 20px 0 0; color: #6f7b7f; font-size: 10px; line-height: 1.6; }

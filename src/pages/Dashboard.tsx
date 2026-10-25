@@ -40,7 +40,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { useAuth } from "@/hooks/use-auth";
+import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
+import { useMutation, useQuery } from "convex/react";
 import { useNavigate } from "react-router";
+import { LEGACY_DATA_KEY, preserveLegacyBackup, previewLegacyMigration, type MigrationPreview } from "@/lib/legacyMigration";
 
 type Activity = "Studying" | "Reading" | "Coding";
 type Session = {
@@ -50,14 +54,9 @@ type Session = {
   coins: number;
   finishedAt: number;
 };
-type ActiveSession = {
-  activity: Activity;
-  durationMinutes: number;
-  elapsedMs: number;
-  startedAt: number | null;
-};
+type ActiveSession = { _id: Id<"focusSessions">; activity: Activity; durationMinutes: number; elapsedMs: number; startedAt: number | null };
 type Task = {
-  id: string;
+  id: Id<"tasks">;
   title: string;
   completed: boolean;
   completedAt: number | null;
@@ -79,7 +78,7 @@ type MomentumData = {
 type View = "today" | "focus" | "tasks" | "entertainment" | "statistics" | "wallet" | "video";
 type SampleVideo = { id: string; title: string; duration: string; category: string; price: number; description: string; colors: [string, string]; artwork: string };
 
-const STORAGE_KEY = "momentum-v1";
+const STORAGE_KEY = LEGACY_DATA_KEY;
 const DAILY_GOAL_MINUTES = 120;
 const ACTIVITIES: Activity[] = ["Studying", "Reading", "Coding"];
 const DURATIONS = [25, 45, 60];
@@ -94,9 +93,9 @@ const SAMPLE_VIDEOS: SampleVideo[] = [
 const emptyData: MomentumData = {
   coins: 0, dailyCap: 120, taskBonus: 5, sessions: [], active: null,
   tasks: [
-    { id: "sample-plan-day", title: "Plan one thing to focus on", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
-    { id: "sample-read", title: "Read for 20 minutes", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
-    { id: "sample-reset", title: "Take a proper screen break", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
+    { id: "sample-plan-day" as Id<"tasks">, title: "Plan one thing to focus on", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
+    { id: "sample-read" as Id<"tasks">, title: "Read for 20 minutes", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
+    { id: "sample-reset" as Id<"tasks">, title: "Take a proper screen break", completed: false, completedAt: null, bonusAwarded: false, rewardCoins: 5 },
   ], taskRewards: [], videoUnlocks: [],
 };
 
@@ -163,7 +162,24 @@ function currentTimestamp() {
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const snapshot = useQuery(api.rewards.snapshot, user ? {} : "skip");
+  const initializeAccount = useMutation(api.rewards.initialize);
+  const setRemoteSettings = useMutation(api.rewards.setSettings);
+  const createRemoteTask = useMutation(api.rewards.createTask);
+  const editRemoteTask = useMutation(api.rewards.editTask);
+  const deleteRemoteTask = useMutation(api.rewards.deleteTask);
+  const completeRemoteTask = useMutation(api.rewards.completeTask);
+  const startRemoteSession = useMutation(api.rewards.startSession);
+  const updateRemoteSession = useMutation(api.rewards.updateActiveSession);
+  const finishRemoteSession = useMutation(api.rewards.finishSession);
+  const purchaseRemoteReward = useMutation(api.rewards.purchaseReward);
+  const importRemoteData = useMutation(api.rewards.importLegacyData);
   const [data, setData] = useState<MomentumData>(readData);
+  const [migrationPreview, setMigrationPreview] = useState<MigrationPreview | null>(null);
+  const [migrationError, setMigrationError] = useState<string | null>(null);
+  const [migrationBusy, setMigrationBusy] = useState(false);
+  const [migrationNotice, setMigrationNotice] = useState<string | null>(null);
+  const [walletTransactions, setWalletTransactions] = useState<Array<{ id: string; amount: number; type: string; description: string; createdAt: number }>>([]);
   const [view, setView] = useState<View>("today");
   const [now, setNow] = useState(0);
   const [dailyCapInput, setDailyCapInput] = useState(String(data.dailyCap));
@@ -176,8 +192,8 @@ export default function Dashboard() {
   const completingTaskIds = useRef(new Set<string>());
   const [pendingTaskAction, setPendingTaskAction] = useState<
     | { kind: "create"; title: string; rewardCoins: number; createdAt: number }
-    | { kind: "edit"; taskId: string; title: string; rewardCoins: number }
-    | { kind: "complete"; taskId: string; title: string; rewardCoins: number; completedAt: number }
+    | { kind: "edit"; taskId: Id<"tasks">; title: string; rewardCoins: number }
+    | { kind: "complete"; taskId: Id<"tasks">; title: string; rewardCoins: number; completedAt: number }
     | { kind: "default"; rewardCoins: number }
     | null
   >(null);
@@ -185,13 +201,23 @@ export default function Dashboard() {
   const [selectedVideoId, setSelectedVideoId] = useState<string | null>(null);
   const [catalogFilter, setCatalogFilter] = useState("All");
 
+  useEffect(() => { if (user && snapshot && !snapshot.initialized) void initializeAccount({}); }, [user, snapshot, initializeAccount]);
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch {
-      toast.error("Focus Rewards couldn't save to this browser.");
-    }
-  }, [data]);
+    if (!snapshot?.initialized) return;
+    setData({
+      coins: snapshot.coins, dailyCap: snapshot.dailyCap, taskBonus: snapshot.taskBonus,
+      sessions: snapshot.sessions.map((session) => ({ ...session, id: session.id, activity: session.activity as Activity })),
+      active: snapshot.active ? { _id: snapshot.active._id, activity: snapshot.active.activity as Activity, durationMinutes: snapshot.active.durationMinutes, elapsedMs: snapshot.active.elapsedMs, startedAt: snapshot.active.startedAt } : null,
+      tasks: snapshot.tasks.map((task) => ({ ...task, id: task.id as Id<"tasks">, bonusAwarded: task.rewardAwarded })),
+      taskRewards: snapshot.transactions.filter((transaction) => transaction.type === "task_reward" || transaction.type === "legacy_task_reward").map((transaction) => ({ taskId: transaction.referenceId ?? transaction.id, title: transaction.description, coins: transaction.amount, awardedAt: transaction.createdAt })),
+      videoUnlocks: snapshot.videoUnlocks,
+    });
+    setWalletTransactions(snapshot.transactions);
+  }, [snapshot]);
+  useEffect(() => {
+    if (!user || !snapshot?.initialized || snapshot.migrationCompletedAt) return;
+    void previewLegacyMigration(localStorage).then(setMigrationPreview).catch((error: unknown) => setMigrationError(error instanceof Error ? error.message : "Could not inspect saved local data."));
+  }, [user, snapshot?.initialized, snapshot?.migrationCompletedAt]);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
@@ -230,6 +256,22 @@ export default function Dashboard() {
     `${video.title} ${video.category} ${video.description}`.toLowerCase().includes(videoQuery.trim().toLowerCase()),
   );
 
+  async function confirmLegacyMigration() {
+    if (!migrationPreview || migrationBusy || migrationPreview.reconcileCoins < 0) return;
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) { setMigrationPreview(null); return; }
+    setMigrationBusy(true); setMigrationError(null);
+    try {
+      preserveLegacyBackup(localStorage, raw, migrationPreview.snapshotHash);
+      const taskRewards = migrationPreview.snapshot.taskRewards.length ? migrationPreview.snapshot.taskRewards : migrationPreview.snapshot.tasks.filter((task) => task.completed && task.bonusAwarded).map((task) => ({ taskId: task.id, title: task.title, coins: task.rewardCoins, awardedAt: task.completedAt ?? 0 }));
+      const result = await importRemoteData({ migrationKey: "momentum-v1", confirmed: true, snapshotHash: migrationPreview.snapshotHash, oldBalance: migrationPreview.snapshot.coins, dailyCap: migrationPreview.snapshot.dailyCap, taskBonus: migrationPreview.snapshot.taskBonus, reconcileCoins: migrationPreview.reconcileCoins, tasks: migrationPreview.snapshot.tasks.map(({ id, title, completed, completedAt, rewardCoins, bonusAwarded }) => ({ id, title, completed, completedAt, rewardCoins, bonusAwarded: bonusAwarded ?? completed })), sessions: migrationPreview.snapshot.sessions, taskRewards, videoUnlocks: migrationPreview.snapshot.videoUnlocks });
+      if (result.alreadyMigrated) setMigrationNotice("This account has already imported its legacy data.");
+      else setMigrationNotice(`Imported ${result.importedTasks} tasks, ${result.importedSessions} sessions, and ${result.importedPurchases} purchases. ${result.reconciledCoins} coins reconciled. Original backup is preserved.`);
+      setMigrationPreview(null);
+    } catch (error) { setMigrationError(error instanceof Error ? error.message : "Migration failed. Your original data and backup are preserved."); }
+    finally { setMigrationBusy(false); }
+  }
+
   async function handleSignOut() {
     await signOut();
     navigate("/");
@@ -237,23 +279,19 @@ export default function Dashboard() {
 
   function startSession(activity: Activity, durationMinutes: number) {
     if (data.active) return;
-    setData((current) => ({
-      ...current,
-      active: { activity, durationMinutes, elapsedMs: 0, startedAt: Date.now() },
-    }));
-    setNow(Date.now());
+    const startedAt = Date.now();
+    void startRemoteSession({ activity, durationMinutes, startedAt, idempotencyKey: crypto.randomUUID() }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't start focus session."));
+    setNow(startedAt);
   }
 
   function pauseSession() {
     if (!data.active || !data.active.startedAt) return;
     const elapsedMs = data.active.elapsedMs + Math.max(0, Date.now() - data.active.startedAt);
-    setData((current) => current.active ? { ...current, active: { ...current.active, elapsedMs, startedAt: null } } : current);
+    void updateRemoteSession({ sessionId: data.active._id, elapsedMs, startedAt: null, status: "active" }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't pause session."));
   }
 
   function resumeSession() {
-    setData((current) => current.active && !current.active.startedAt
-      ? { ...current, active: { ...current.active, startedAt: Date.now() } }
-      : current);
+    if (data.active && !data.active.startedAt) void updateRemoteSession({ sessionId: data.active._id, elapsedMs: data.active.elapsedMs, startedAt: Date.now(), status: "active" }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't resume session."));
     setNow(Date.now());
   }
 
@@ -264,20 +302,13 @@ export default function Dashboard() {
     const totalMs = active.elapsedMs + (active.startedAt ? Math.max(0, completedAt - active.startedAt) : 0);
     const minutes = Math.floor(totalMs / 60_000);
     if (!minutes) {
-      setData((current) => ({ ...current, active: null }));
+      void updateRemoteSession({ sessionId: active._id, elapsedMs: totalMs, startedAt: null, status: "cancelled" }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't cancel session."));
       toast("Focus session ended before a full minute. No coins were earned.");
       return;
     }
     const completedToday = data.sessions.filter((session) => dayKey(session.finishedAt) === dayKey(completedAt));
-    const minutesBefore = completedToday.reduce((sum, session) => sum + session.minutes, 0);
-    const coinsBefore = completedToday.reduce((sum, session) => sum + session.coins, 0);
-    const coins = Math.max(0, Math.min(data.dailyCap - coinsBefore, cumulativeReward(minutesBefore + minutes) - cumulativeReward(minutesBefore)));
-    const session: Session = { id: `${completedAt}-${Math.random().toString(36).slice(2, 8)}`, activity: active.activity, minutes, coins, finishedAt: completedAt };
-    setData((current) => ({ ...current, coins: current.coins + coins, sessions: [session, ...current.sessions], active: null }));
+    void finishRemoteSession({ sessionId: active._id, elapsedMs: totalMs, idempotencyKey: `finish:${active._id}` }).then((result) => toast.success(`Session complete · ${result.minutes} focused min`, { description: result.coins ? `You earned ${result.coins} ${result.coins === 1 ? "coin" : "coins"}. Nice work.` : "Your daily coin limit has been reached." })).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't finish the focus session."));
     setNow(completedAt);
-    toast.success(minutes ? `Session complete · ${minutes} focused min` : "Session saved", {
-      description: coins ? `You earned ${coins} ${coins === 1 ? "coin" : "coins"}. Nice work.` : "Every minute counts. Your next minute is ready when you are.",
-    });
   }, [data]);
 
   useEffect(() => {
@@ -288,13 +319,8 @@ export default function Dashboard() {
 
   function saveCap() {
     const value = Number(dailyCapInput);
-    if (!Number.isInteger(value) || value < 1 || value > 500) {
-      toast.error("Set a daily cap between 1 and 500 coins.");
-      setDailyCapInput(String(data.dailyCap));
-      return;
-    }
-    setData((current) => ({ ...current, dailyCap: value }));
-    toast.success("Daily focus reward limit updated.");
+    if (!Number.isInteger(value) || value < 1 || value > 500) { toast.error("Set a daily cap between 1 and 500 coins."); setDailyCapInput(String(data.dailyCap)); return; }
+    void setRemoteSettings({ dailyCap: value, taskBonus: data.taskBonus }).then(() => toast.success("Daily focus reward limit updated.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't save settings."));
   }
 
   function saveTaskBonus() {
@@ -308,7 +334,7 @@ export default function Dashboard() {
       setPendingTaskAction({ kind: "default", rewardCoins: value });
       return;
     }
-    applyTaskAction({ kind: "default", rewardCoins: value });
+    void setRemoteSettings({ dailyCap: data.dailyCap, taskBonus: value }).then(() => toast.success("Default reward for new tasks updated.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't save settings."));
   }
 
   function parseTaskReward(input: string) {
@@ -341,7 +367,7 @@ export default function Dashboard() {
     applyTaskAction(action);
   }
 
-  function requestTaskEdit(taskId: string) {
+  function requestTaskEdit(taskId: Id<"tasks">) {
     const title = editingTaskTitle.trim();
     if (!title || title.length > 100) {
       toast.error("Task names must be between 1 and 100 characters.");
@@ -357,7 +383,7 @@ export default function Dashboard() {
     applyTaskAction(action);
   }
 
-  function requestTaskCompletion(taskId: string) {
+  function requestTaskCompletion(taskId: Id<"tasks">) {
     const task = data.tasks.find((item) => item.id === taskId);
     if (!task || task.completed || task.bonusAwarded || completingTaskIds.current.has(taskId)) return;
     const action = { kind: "complete" as const, taskId, title: task.title, rewardCoins: task.rewardCoins, completedAt: currentTimestamp() };
@@ -372,50 +398,28 @@ export default function Dashboard() {
   function applyTaskAction(action: NonNullable<typeof pendingTaskAction>) {
     if (action.kind === "create") {
       const createdAt = action.createdAt;
-      setData((current) => ({
-        ...current,
-        tasks: [{ id: `task-${createdAt}-${Math.random().toString(36).slice(2, 8)}`, title: action.title, completed: false, completedAt: null, bonusAwarded: false, rewardCoins: action.rewardCoins }, ...current.tasks],
-      }));
+      void createRemoteTask({ title: action.title, rewardCoins: action.rewardCoins, idempotencyKey: `task-${createdAt}-${crypto.randomUUID()}` }).then(() => toast.success("Task added to your list.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't add task."));
       setTaskDraft("");
       setNewTaskReward(String(data.taskBonus));
-      toast.success("Task added to your list.");
       return;
     }
     if (action.kind === "edit") {
       const task = data.tasks.find((item) => item.id === action.taskId);
       if (!task || task.completed) return;
-      setData((current) => ({
-        ...current,
-        tasks: current.tasks.map((task) => task.id === action.taskId && !task.completed
-          ? { ...task, title: action.title, rewardCoins: action.rewardCoins }
-          : task),
-      }));
+      void editRemoteTask({ taskId: action.taskId, title: action.title, rewardCoins: action.rewardCoins }).then(() => toast.success("Task updated.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't update task."));
       setEditingTaskId(null);
       setEditingTaskTitle("");
       setEditingTaskReward("");
-      toast.success("Task updated.");
       return;
     }
     if (action.kind === "default") {
-      setData((current) => ({ ...current, taskBonus: action.rewardCoins }));
-      toast.success("Default reward for new tasks updated.");
+      void setRemoteSettings({ dailyCap: data.dailyCap, taskBonus: action.rewardCoins }).then(() => toast.success("Default reward for new tasks updated.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't save settings."));
       return;
     }
     const task = data.tasks.find((item) => item.id === action.taskId);
     if (!task || task.completed || task.bonusAwarded) return;
-    const completedAt = action.completedAt;
     const rewardCoins = action.rewardCoins;
-    setData((current) => {
-      const currentTask = current.tasks.find((item) => item.id === action.taskId);
-      if (!currentTask || currentTask.completed || currentTask.bonusAwarded) return current;
-      return {
-        ...current,
-        coins: current.coins + rewardCoins,
-        tasks: current.tasks.map((item) => item.id === action.taskId ? { ...item, completed: true, completedAt, bonusAwarded: true } : item),
-        taskRewards: rewardCoins ? [{ taskId: currentTask.id, title: currentTask.title, coins: rewardCoins, awardedAt: completedAt }, ...current.taskRewards] : current.taskRewards,
-      };
-    });
-    toast.success("Task complete", { description: rewardCoins ? `You earned ${rewardCoins} ${rewardCoins === 1 ? "coin" : "coins"}.` : "Nicely done. This task has no coin reward." });
+    void completeRemoteTask({ taskId: action.taskId, idempotencyKey: `complete:${action.taskId}` }).then((result) => toast.success(result.alreadyCompleted ? "Task was already completed." : "Task complete", { description: rewardCoins ? `You earned ${rewardCoins} ${rewardCoins === 1 ? "coin" : "coins"}.` : "Nicely done. This task has no coin reward." })).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't complete task."));
   }
 
   function confirmTaskAction() {
@@ -428,9 +432,8 @@ export default function Dashboard() {
     setPendingTaskAction(null);
   }
 
-  function deleteTask(taskId: string) {
-    setData((current) => ({ ...current, tasks: current.tasks.filter((task) => task.id !== taskId) }));
-    toast("Task removed.");
+  function deleteTask(taskId: Id<"tasks">) {
+    void deleteRemoteTask({ taskId }).then(() => toast("Task removed.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't delete task."));
   }
 
   function unlockVideo(video: SampleVideo) {
@@ -443,9 +446,7 @@ export default function Dashboard() {
       toast.error("Not quite enough coins yet.", { description: `You need ${video.price - data.coins} more coins to unlock this video.` });
       return;
     }
-    const unlockedAt = Date.now();
-    setData((current) => ({ ...current, coins: current.coins - video.price, videoUnlocks: [{ videoId: video.id, unlockedAt, cost: video.price }, ...current.videoUnlocks] }));
-    toast.success("Added to your collection", { description: `${video.price} coins spent on “${video.title}”.` });
+    void purchaseRemoteReward({ rewardId: video.id, cost: video.price, idempotencyKey: `purchase:${video.id}` }).then((result) => { if (!result.alreadyPurchased) toast.success("Added to your collection", { description: `${video.price} coins spent on “${video.title}”.` }); }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't purchase this reward."));
   }
 
   function openVideo(video: SampleVideo) {
@@ -543,7 +544,7 @@ export default function Dashboard() {
             <motion.section key="wallet" className="page-content" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
               <div className="page-heading"><div><span className="eyebrow">EARNED ONE MOMENT AT A TIME</span><h1>Your wallet</h1><p>Every coin started with a little effort.</p></div><div className="heading-icon gold-icon"><WalletCards size={19} /></div></div>
               <section className="glass-panel wallet-hero"><div className="wallet-coin-icon"><Coins size={23} /></div><span className="tile-label">AVAILABLE COINS</span><strong>{data.coins}</strong><p>Earn coins by focusing or finishing a task, then use them to unlock a mindful break.</p><button onClick={() => setView("entertainment")}>Browse rewards <ArrowRight size={14} /></button></section>
-              <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Coin activity</h2><p>Your recent earning and spending.</p></div></div>{data.sessions.length || data.taskRewards.length || data.videoUnlocks.length ? <div className="session-list">{[...data.sessions.map((session) => ({ id: `focus-${session.id}`, title: `${session.activity} focus · ${session.minutes} min`, date: session.finishedAt, amount: session.coins, kind: "earned" as const })), ...data.taskRewards.map((reward) => ({ id: `task-${reward.taskId}`, title: `Task complete · ${reward.title}`, date: reward.awardedAt, amount: reward.coins, kind: "earned" as const })), ...data.videoUnlocks.map((unlock) => ({ id: `unlock-${unlock.videoId}`, title: `Reward unlocked · ${SAMPLE_VIDEOS.find((video) => video.id === unlock.videoId)?.title ?? "Video"}`, date: unlock.unlockedAt, amount: unlock.cost, kind: "spent" as const }))].sort((a, b) => b.date - a.date).map((entry) => <div className="session-row wallet-entry" key={entry.id}><span className={`wallet-activity-icon ${entry.kind}`}><Coins size={14} /></span><div className="session-copy"><strong>{entry.title}</strong><span>{shortDate(entry.date)}</span></div><span className={`wallet-amount ${entry.kind}`}>{entry.kind === "earned" ? "+" : "−"}{entry.amount}</span></div>)}</div> : <div className="empty-state"><span className="empty-icon"><WalletCards size={19} /></span><strong>Your wallet is ready</strong><span>Complete a focus session or task to earn your first coins.</span></div>}</section>
+              <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Coin activity</h2><p>Your recent earning and spending.</p></div></div>{walletTransactions.length ? <div className="session-list">{walletTransactions.map((transaction) => <div className="session-row wallet-entry" key={transaction.id}><span className={`wallet-activity-icon ${transaction.amount < 0 ? "spent" : "earned"}`}><Coins size={14} /></span><div className="session-copy"><strong>{transaction.description}</strong><span>{shortDate(transaction.createdAt)}</span></div><span className={`wallet-amount ${transaction.amount < 0 ? "spent" : "earned"}`}>{transaction.amount > 0 ? "+" : "−"}{Math.abs(transaction.amount)}</span></div>)}</div> : <div className="empty-state"><span className="empty-icon"><WalletCards size={19} /></span><strong>Your wallet is ready</strong><span>Complete a focus session or task to earn your first coins.</span></div>}</section>
             </motion.section>
           ) : view === "statistics" ? (
             <motion.section key="statistics" className="page-content" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
@@ -578,9 +579,11 @@ export default function Dashboard() {
             <div className="page-content"><p>Choose a section to continue.</p></div>
           )}
         </div>
-        <footer className="main-footer"><span>Focus Rewards <span className="brand-period">·</span> focus first, enjoy it after</span><span>Saved on this device</span></footer>
+        <footer className="main-footer"><span>Focus Rewards <span className="brand-period">·</span> focus first, enjoy it after</span><span>{snapshot?.initialized ? "Synced securely to your account" : "Connecting to your account…"}</span></footer>
+        {migrationError && !migrationPreview && <div className="glass-panel migration-notice" role="alert"><strong>Saved data needs review</strong><p>{migrationError}</p></div>}
+        {migrationNotice && <div className="glass-panel migration-notice" role="status"><strong>Migration complete</strong><p>{migrationNotice}</p><button type="button" onClick={() => setMigrationNotice(null)}>Dismiss</button></div>}
+        {migrationPreview && !snapshot?.migrationCompletedAt && <div className="migration-backdrop"><section className="glass-panel migration-dialog" role="dialog" aria-modal="true" aria-labelledby="migration-title"><span className="eyebrow">ONE-TIME ACCOUNT IMPORT</span><h2 id="migration-title">Review your saved rewards</h2><p>We found Focus Rewards data stored on this browser. It will only be imported into the signed-in account shown in the header.</p><dl><div><dt>Current saved balance</dt><dd>{migrationPreview.snapshot.coins} coins</dd></div><div><dt>Wallet event total</dt><dd>{migrationPreview.eventNet} coins</dd></div><div><dt>Balance reconciliation</dt><dd>{migrationPreview.reconcileCoins > 0 ? "+" : ""}{migrationPreview.reconcileCoins} coins</dd></div><div><dt>Tasks / sessions / purchases</dt><dd>{migrationPreview.snapshot.tasks.length} / {migrationPreview.snapshot.sessions.length} / {migrationPreview.snapshot.videoUnlocks.length}</dd></div></dl>{migrationPreview.warnings.map((warning) => <p className="migration-warning" key={warning}>{warning}</p>)}<p className="migration-footnote">Your exact original data will be backed up before import. The backup and localStorage entry are never deleted automatically.</p><div className="migration-actions"><button type="button" className="migration-secondary" onClick={() => setMigrationPreview(null)}>Not now</button><button type="button" disabled={migrationBusy || migrationPreview.reconcileCoins < 0} onClick={() => void confirmLegacyMigration()}>{migrationBusy ? "Importing…" : "Import and reconcile"}</button></div>{migrationError && <p className="migration-warning" role="alert">{migrationError}</p>}</section></div>}
       </main>
-
       <nav className="mobile-nav" aria-label="Mobile navigation">
         {nav.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? "mobile-active" : ""} onClick={() => setView(id)}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></button>)}
       </nav>

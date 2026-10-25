@@ -32,12 +32,67 @@ const schema = defineSchema(
       role: v.optional(roleValidator), // role of the user. do not remove
     }).index("email", ["email"]), // index for the email. do not remove or modify
 
-    // add other tables here
+    accountData: defineTable({
+      userId: v.id("users"),
+      coins: v.number(),
+      dailyCap: v.number(),
+      taskBonus: v.number(),
+      migrationCompletedAt: v.optional(v.number()),
+      migrationReport: v.optional(v.object({
+        importedTasks: v.number(),
+        importedSessions: v.number(),
+        importedPurchases: v.number(),
+        reconciledCoins: v.number(),
+        oldBalance: v.number(),
+        eventNet: v.number(),
+      })),
+    }).index("by_user", ["userId"]),
 
-    // tableName: defineTable({
-    //   ...
-    //   // table fields
-    // }).index("by_field", ["field"])
+    tasks: defineTable({
+      userId: v.id("users"),
+      legacyId: v.optional(v.string()),
+      title: v.string(),
+      completed: v.boolean(),
+      completedAt: v.union(v.number(), v.null()),
+      rewardCoins: v.number(),
+      rewardAwarded: v.optional(v.boolean()),
+    }).index("by_user", ["userId"]).index("by_user_legacy", ["userId", "legacyId"]),
+
+    focusSessions: defineTable({
+      userId: v.id("users"),
+      legacyId: v.optional(v.string()),
+      activity: v.string(),
+      durationMinutes: v.number(),
+      elapsedMs: v.number(),
+      startedAt: v.union(v.number(), v.null()),
+      status: v.union(v.literal("active"), v.literal("complete"), v.literal("cancelled")),
+      minutes: v.optional(v.number()),
+      coins: v.optional(v.number()),
+      finishedAt: v.optional(v.number()),
+    }).index("by_user", ["userId"]).index("by_user_legacy", ["userId", "legacyId"]),
+
+    walletTransactions: defineTable({
+      userId: v.id("users"),
+      amount: v.number(),
+      type: v.union(
+        v.literal("focus_reward"), v.literal("task_reward"), v.literal("library_purchase"),
+        v.literal("legacy_focus_reward"), v.literal("legacy_task_reward"),
+        v.literal("legacy_library_purchase"), v.literal("legacy_reconciliation"),
+      ),
+      description: v.string(),
+      referenceType: v.optional(v.string()),
+      referenceId: v.optional(v.string()),
+      idempotencyKey: v.string(),
+      createdAt: v.number(),
+    }).index("by_user_time", ["userId", "createdAt"]).index("by_user_idempotency", ["userId", "idempotencyKey"]),
+
+    libraryPurchases: defineTable({
+      userId: v.id("users"),
+      rewardId: v.string(),
+      cost: v.number(),
+      purchasedAt: v.number(),
+      idempotencyKey: v.string(),
+    }).index("by_user", ["userId"]).index("by_user_reward", ["userId", "rewardId"]).index("by_user_idempotency", ["userId", "idempotencyKey"]),
   },
   {
     schemaValidation: false,

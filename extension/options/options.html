@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Focus Rewards settings</title>
+    <link rel="stylesheet" href="options.css" />
+    <script src="options.js" defer></script>
+  </head>
+  <body>
+    <main class="settings-card">
+      <div class="brand"><span class="coin">◈</span><span>Focus Rewards</span></div>
+      <p class="eyebrow">YOUTUBE</p>
+      <h1>Video estimates</h1>
+      <p class="description">See an estimated coin value beneath regular video recommendations. Estimates use video duration and never change your balance or control playback.</p>
+      <label class="setting-row" for="youtube-price-enabled">
+        <span><strong>Show price estimates</strong><small>Hide or show the inline estimate on YouTube.</small></span>
+        <input id="youtube-price-enabled" type="checkbox" />
+      </label>
+      <p id="save-status" class="status" role="status" aria-live="polite"></p>
+      <p class="note">Estimated at 1.2 coins per minute, rounded up. Shorts and live streams are excluded.</p>
+    </main>
+  </body>
+</html>
