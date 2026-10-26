@@ -3,7 +3,7 @@ import type { TestConvex } from "convex-test";
 import { describe, expect, it } from "vitest";
 import schema from "./schema";
 import { api } from "./_generated/api";
-import { resolveBetaGateView } from "../components/betaGateView";
+import { resolveBetaGateView, resolveOnboardingDisplayName } from "../components/betaGateView";
 import type { Doc } from "./_generated/dataModel";
 
 const modules = {
@@ -76,6 +76,14 @@ describe("private beta access", () => {
       administrator: false,
       canClaimInitialAdministrator: true,
     }, "/dashboard")).toBe("administrator-bootstrap");
+  });
+
+  it("prefills onboarding from a saved beta-request name while allowing edits and legacy fallbacks", () => {
+    expect(resolveOnboardingDisplayName("  Jamie  ", undefined, undefined, false, "")).toBe("  Jamie  ");
+    expect(resolveOnboardingDisplayName(null, "Profile Name", undefined, false, "")).toBe("Profile Name");
+    expect(resolveOnboardingDisplayName(null, null, "Legacy Name", false, "")).toBe("Legacy Name");
+    expect(resolveOnboardingDisplayName("Jamie", undefined, undefined, true, "Jordan")).toBe("Jordan");
+    expect(resolveOnboardingDisplayName(null, null, null, false, "")).toBe("");
   });
 
   it("preserves the existing administrator account and existing reward data during bootstrap", async () => {
@@ -236,6 +244,58 @@ describe("private beta access", () => {
     await expect(friend.mutation(api.access.claimInvitation, { code })).rejects.toThrow(/invalid, expired, revoked, or already used/);
   });
 
+  it("links guest recovery only to the authenticated anonymous user and never creates or changes an account", async () => {
+    const t = createTest();
+    const guestId = await t.run(async (ctx) => await ctx.db.insert("users", { isAnonymous: true }));
+    const otherId = await t.run(async (ctx) => await ctx.db.insert("users", { isAnonymous: true }));
+    const guest = t.withIdentity({ subject: `${guestId}|guest`, isAnonymous: true });
+    const other = t.withIdentity({ subject: `${otherId}|other`, isAnonymous: true });
+    const credential = "A".repeat(43);
+    const replacementCredential = "B".repeat(43);
+    await expect(t.mutation(api.access.registerGuestRecoveryCredential, { credential })).rejects.toThrow(/Sign in/);
+    await expect(guest.mutation(api.access.registerGuestRecoveryCredential, { credential: "invalid" })).rejects.toThrow(/Invalid guest recovery credential/);
+    await expect(guest.mutation(api.access.registerGuestRecoveryCredential, { credential })).resolves.toEqual({ registered: true });
+    await expect(guest.mutation(api.access.registerGuestRecoveryCredential, { credential })).resolves.toEqual({ registered: true });
+    await expect(other.mutation(api.access.registerGuestRecoveryCredential, { credential })).rejects.toThrow(/already linked to another account/);
+    const verifiedUserId = await createUser(t, "verified@example.com");
+    const verified = t.withIdentity({ subject: `${verifiedUserId}|verified`, email: "verified@example.com" });
+    await expect(verified.mutation(api.access.registerGuestRecoveryCredential, { credential: replacementCredential })).rejects.toThrow(/signed-in guest account/);
+    await expect(guest.mutation(api.access.registerGuestRecoveryCredential, { credential: replacementCredential })).resolves.toEqual({ registered: true });
+    await expect(t.run(async (ctx) => ({
+      users: await ctx.db.query("users").collect(),
+      accounts: await ctx.db.query("authAccounts").collect(),
+    }))).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ _id: guestId, isAnonymous: true }), expect.objectContaining({ _id: otherId, isAnonymous: true })]),
+      accounts: expect.arrayContaining([
+        expect.objectContaining({ userId: guestId, provider: "guest-recovery", providerAccountId: expect.not.stringContaining(credential) }),
+        expect.objectContaining({ userId: guestId, provider: "guest-recovery", providerAccountId: expect.not.stringContaining(replacementCredential) }),
+      ]),
+    });
+  });
+
+  it("returns a validated saved requester name only to the authenticated account, including after admin approval", async () => {
+    const t = createTest();
+    const { admin } = await makeAdmin(t);
+    const firstId = await t.run(async (ctx) => await ctx.db.insert("users", { isAnonymous: true }));
+    const secondId = await t.run(async (ctx) => await ctx.db.insert("users", { isAnonymous: true }));
+    const first = t.withIdentity({ subject: `${firstId}|first-guest`, isAnonymous: true });
+    const second = t.withIdentity({ subject: `${secondId}|second-guest`, isAnonymous: true });
+    await first.mutation(api.access.requestApproval, { requesterName: "  Jamie  " });
+    await t.run(async (ctx) => {
+      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", firstId)).unique();
+      expect(access?.requesterName).toBe("Jamie");
+    });
+    await expect(first.query(api.access.status)).resolves.toMatchObject({ requesterName: "Jamie", approved: false, status: "pending" });
+    await expect(second.query(api.access.status)).resolves.toMatchObject({ requesterName: null, approved: false, status: "pending" });
+    await admin.mutation(api.access.approveUser, { userId: firstId });
+    await expect(first.query(api.access.status)).resolves.toMatchObject({ requesterName: "Jamie", approved: true, status: "approved" });
+    await t.run(async (ctx) => {
+      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", firstId)).unique();
+      await ctx.db.patch(access!._id, { requesterName: "\u0000Invalid" });
+    });
+    await expect(first.query(api.access.status)).resolves.toMatchObject({ requesterName: null, approved: true, status: "approved" });
+  });
+
   it("creates a named manual approval request for a signed-in guest and only an admin may approve it", async () => {
     const t = createTest();
     const { admin } = await makeAdmin(t);
@@ -245,9 +305,11 @@ describe("private beta access", () => {
     await expect(guest.query(api.rewards.snapshot)).rejects.toThrow(/not been approved/);
     const pending = await admin.query(api.access.adminOverview);
     expect(pending.users.find((user) => user.userId === guestId)?.requesterName).toBe("Jamie");
+    expect((await guest.query(api.access.status)).requesterName).toBe("Jamie");
     await expect(guest.mutation(api.access.approveUser, { userId: guestId })).rejects.toThrow();
     await admin.mutation(api.access.approveUser, { userId: guestId });
     expect((await guest.query(api.access.status)).approved).toBe(true);
+    expect((await guest.query(api.access.status)).requesterName).toBe("Jamie");
     await expect(guest.mutation(api.access.requestApproval, { requesterName: "Another name" })).resolves.toEqual({ approved: true });
     await expect(guest.mutation(api.access.requestApproval, { requesterName: "\u0000" })).rejects.toThrow(/control characters/);
   });

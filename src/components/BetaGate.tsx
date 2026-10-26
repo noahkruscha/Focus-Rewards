@@ -8,7 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Loader2, LockKeyhole, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
-import { resolveBetaGateView } from "./betaGateView";
+import { resolveBetaGateView, resolveOnboardingDisplayName } from "./betaGateView";
 
 export function BetaGate({ children }: { children: ReactNode }) {
   const { isLoading, isAuthenticated, user, signOut } = useAuth();
@@ -22,6 +22,8 @@ export function BetaGate({ children }: { children: ReactNode }) {
   const [code, setCode] = useState("");
   const [requesterName, setRequesterName] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [editedDisplayName, setEditedDisplayName] = useState(false);
+  const onboardingDisplayName = resolveOnboardingDisplayName(status?.requesterName, user?.displayName, user?.name, editedDisplayName, displayName);
   const [busy, setBusy] = useState(false);
 
   async function submitInvitation(event: FormEvent<HTMLFormElement>) {
@@ -42,7 +44,7 @@ export function BetaGate({ children }: { children: ReactNode }) {
     event.preventDefault();
     setBusy(true);
     try {
-      const result = await completeOnboarding({ displayName });
+      const result = await completeOnboarding({ displayName: onboardingDisplayName });
       toast.success(`Welcome, ${result.displayName}.`);
       navigate("/dashboard", { replace: true });
     } catch (error) {
@@ -66,7 +68,7 @@ export function BetaGate({ children }: { children: ReactNode }) {
     return <main className="flex min-h-screen items-center justify-center bg-background p-6">
       <Card className="w-full max-w-md border-white/10 bg-card/90">
         <CardHeader className="text-center"><div className="mx-auto mb-2 flex size-12 items-center justify-center rounded-full bg-primary/10 text-primary"><ShieldCheck className="size-5" /></div><CardTitle className="text-2xl tracking-tight">Make this space yours</CardTitle><CardDescription>Your name will be displayed in Focus Rewards. You can use just one name.</CardDescription></CardHeader>
-        <CardContent><form onSubmit={(event) => void submitName(event)} className="space-y-4"><label htmlFor="onboarding-display-name" className="text-sm font-medium">What should we call you?</label><Input id="onboarding-display-name" autoComplete="nickname" autoFocus maxLength={40} required value={displayName} onChange={(event) => setDisplayName(event.target.value)} aria-describedby="onboarding-name-help" className="focus-visible:ring-2" /><p id="onboarding-name-help" className="text-xs text-muted-foreground">Up to 40 characters. Your email remains your sign-in identity.</p><Button className="w-full" type="submit" disabled={busy || !displayName.trim()}>{busy ? "Saving…" : "Continue"}</Button></form></CardContent>
+        <CardContent><form onSubmit={(event) => void submitName(event)} className="space-y-4"><label htmlFor="onboarding-display-name" className="text-sm font-medium">What should we call you?</label><Input id="onboarding-display-name" autoComplete="nickname" autoFocus maxLength={40} required value={onboardingDisplayName} onChange={(event) => { setEditedDisplayName(true); setDisplayName(event.target.value); }} aria-describedby="onboarding-name-help" className="focus-visible:ring-2" /><p id="onboarding-name-help" className="text-xs text-muted-foreground">Up to 40 characters. Your email remains your sign-in identity.</p><Button className="w-full" type="submit" disabled={busy || !onboardingDisplayName.trim()}>{busy ? "Saving…" : "Continue"}</Button></form></CardContent>
       </Card>
     </main>;
   }

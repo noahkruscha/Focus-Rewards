@@ -1,3 +1,14 @@
+export function resolveOnboardingDisplayName(
+  requesterName: string | null | undefined,
+  displayName: string | null | undefined,
+  legacyName: string | null | undefined,
+  edited: boolean,
+  editedName: string,
+): string {
+  if (edited) return editedName;
+  return requesterName ?? displayName ?? legacyName ?? "";
+}
+
 export type BetaGateStatus = {
   approvalRequired: boolean;
   approved: boolean;
