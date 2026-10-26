@@ -1,5 +1,14 @@
 import { Button } from "@/components/ui/button";
 import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Card,
   CardContent,
   CardDescription,
@@ -16,12 +25,13 @@ import {
 
 import { useAuth } from "@/hooks/use-auth";
 import { api } from "@/convex/_generated/api";
-import { useMutation } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { ArrowRight, Coins, Loader2, LockKeyhole, Mail, UserX, Zap, Ticket } from "lucide-react";
 import { Suspense, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
+import { continueAsGuestIfNoSavedAccount, createGuestRecoveryCredential, getPendingGuestRecoveryCredential, hasKnownGuestOnDevice, recoverGuestAccount, saveGuestRecoveryCredential } from "@/lib/guestRecovery";
 
 interface AuthProps {
   redirectAfterAuth?: string;
@@ -41,6 +51,8 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const { isLoading: authLoading, isAuthenticated, signIn } = useAuth();
   const validateInvitation = useMutation(api.access.validateInvitation);
   const claimInvitation = useMutation(api.access.claimInvitation);
+  const registerGuestRecovery = useMutation(api.access.registerGuestRecoveryCredential);
+  const authStatus = useQuery(api.access.status, isAuthenticated ? {} : "skip");
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const redirect = resolveRedirectAfterAuth(
@@ -55,12 +67,19 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const [otp, setOtp] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [guestChoiceOpen, setGuestChoiceOpen] = useState(false);
+  const [newGuestConfirmationOpen, setNewGuestConfirmationOpen] = useState(false);
+  const [guestRecoveryError, setGuestRecoveryError] = useState<string | null>(null);
+  const [guestRecoveryPending, setGuestRecoveryPending] = useState(false);
+  const [guestRecoveryRetry, setGuestRecoveryRetry] = useState(0);
+  const guestAttemptRef = useRef(false);
+  const guestSignInInProgressRef = useRef(false);
 
   useEffect(() => {
-    if (!authLoading && isAuthenticated && !pendingInvitationCode) {
+    if (!authLoading && isAuthenticated && !pendingInvitationCode && !guestRecoveryPending) {
       navigate(redirect);
     }
-  }, [authLoading, isAuthenticated, navigate, pendingInvitationCode, redirect]);
+  }, [authLoading, guestRecoveryPending, isAuthenticated, navigate, pendingInvitationCode, redirect]);
 
   useEffect(() => {
     if (!isAuthenticated || !pendingInvitationCode) return;
@@ -125,14 +144,101 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
   };
 
   const handleGuestLogin = async () => {
+    if (guestAttemptRef.current) return;
+    guestAttemptRef.current = true;
     setIsLoading(true);
     setError(null);
+    setGuestRecoveryError(null);
     try {
-      await signIn("anonymous");
-      navigate(redirect);
+      if (isAuthenticated || hasKnownGuestOnDevice(window.localStorage)) {
+        setGuestChoiceOpen(true);
+        return;
+      }
+      setGuestRecoveryPending(true);
+      guestSignInInProgressRef.current = true;
+      const created = await continueAsGuestIfNoSavedAccount(window.localStorage, signIn, () => {
+        saveGuestRecoveryCredential(window.localStorage, createGuestRecoveryCredential(), "pending");
+      });
+      guestSignInInProgressRef.current = false;
+      if (created) setGuestRecoveryRetry((retry) => retry + 1);
+      else setGuestRecoveryPending(false);
     } catch (error) {
-      console.error("Guest login error:", error);
-      setError(`Unable to continue as a guest: ${error instanceof Error ? error.message : "Please try again."}`);
+      guestSignInInProgressRef.current = false;
+      if (getPendingGuestRecoveryCredential(window.localStorage)) {
+        setGuestRecoveryError(error instanceof Error ? error.message : "Guest sign-in could not be confirmed. Recover the account or retry before creating another.");
+        setGuestChoiceOpen(true);
+      } else {
+        setGuestRecoveryPending(false);
+        setError(`Unable to continue as a guest: ${error instanceof Error ? error.message : "Please try again."}`);
+      }
+    } finally {
+      guestAttemptRef.current = false;
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated || !authStatus?.guestAccount || guestSignInInProgressRef.current) return;
+    const credential = getPendingGuestRecoveryCredential(window.localStorage);
+    if (!credential) return;
+    let cancelled = false;
+    void registerGuestRecovery({ credential }).then(() => {
+      if (!cancelled) {
+        saveGuestRecoveryCredential(window.localStorage, credential, "ready");
+        setGuestRecoveryPending(false);
+        setGuestRecoveryError(null);
+        setGuestRecoveryRetry(0);
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setGuestRecoveryPending(true);
+        setGuestRecoveryError("Guest sign-in succeeded, but its recovery credential could not be saved. Do not sign out until you retry.");
+      }
+    });
+    return () => { cancelled = true; };
+  }, [authStatus?.guestAccount, guestRecoveryRetry, isAuthenticated, registerGuestRecovery]);
+
+  const handleRecoverGuest = async () => {
+    if (guestAttemptRef.current) return;
+    guestAttemptRef.current = true;
+    setIsLoading(true);
+    setGuestRecoveryError(null);
+    try {
+      await recoverGuestAccount(window.localStorage, signIn);
+      setGuestChoiceOpen(false);
+      navigate(redirect, { replace: true });
+    } catch (recoveryError) {
+      setGuestRecoveryError(recoveryError instanceof Error ? recoveryError.message : "The existing account could not be restored.");
+    } finally {
+      guestAttemptRef.current = false;
+      setIsLoading(false);
+    }
+  };
+
+  const handleCreateSeparateGuest = async () => {
+    if (guestAttemptRef.current) return;
+    guestAttemptRef.current = true;
+    setIsLoading(true);
+    setGuestRecoveryError(null);
+    const credential = createGuestRecoveryCredential();
+    setGuestRecoveryPending(true);
+    guestSignInInProgressRef.current = true;
+    try {
+      saveGuestRecoveryCredential(window.localStorage, credential, "pending");
+      const result = await signIn("anonymous", {});
+      if (!result.signingIn) throw new Error("Guest sign-in did not establish an authenticated session.");
+      guestSignInInProgressRef.current = false;
+      setGuestRecoveryRetry((retry) => retry + 1);
+      setNewGuestConfirmationOpen(false);
+      setGuestChoiceOpen(false);
+    } catch (createError) {
+      guestSignInInProgressRef.current = false;
+      setGuestRecoveryPending(false);
+      setGuestRecoveryError(createError instanceof Error ? createError.message : "A new account could not be created.");
+      setNewGuestConfirmationOpen(false);
+      setGuestChoiceOpen(true);
+    } finally {
+      guestAttemptRef.current = false;
       setIsLoading(false);
     }
   };
@@ -188,6 +294,9 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                   {error && (
                     <p className="mt-2 text-sm text-red-500">{error}</p>
                   )}
+                  {guestRecoveryPending && <p className="mt-2 text-sm text-amber-500">The new guest account is being secured for recovery before continuing.</p>}
+                  {isAuthenticated && authStatus?.guestAccount && guestRecoveryPending && <div role="alert" className="mt-2 text-sm text-destructive">{guestRecoveryError || "Guest account recovery is being secured."}<Button type="button" variant="link" disabled={isLoading} onClick={() => setGuestRecoveryRetry((retry) => retry + 1)}>Retry</Button></div>}
+                  {guestRecoveryError && !isAuthenticated && <p role="alert" className="mt-2 text-sm text-destructive">{guestRecoveryError}</p>}
                   
                   <div className="mt-4">
                     <div className="relative">
@@ -303,6 +412,34 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
           <div className="auth-card-foot"><LockKeyhole size={12} /> Your account is secured with email verification.</div>
         </Card>
       </div>
+      <AlertDialog open={guestChoiceOpen} onOpenChange={(open) => { if (!isLoading) setGuestChoiceOpen(open); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>An account is already saved in this browser</AlertDialogTitle>
+            <AlertDialogDescription>Choose whether to restore the account linked to its saved recovery credential or deliberately create a separate account. Existing coins, sessions, rewards, and beta approval will not be moved or deleted.</AlertDialogDescription>
+          </AlertDialogHeader>
+          {guestRecoveryError && <p role="alert" className="text-sm text-destructive">{guestRecoveryError}</p>}
+          {guestRecoveryPending && isAuthenticated && authStatus?.guestAccount && <Button type="button" variant="link" disabled={isLoading} onClick={() => setGuestRecoveryRetry((retry) => retry + 1)}>Retry saving guest account recovery</Button>}
+          {!isAuthenticated && guestRecoveryPending && <Button type="button" variant="link" disabled={isLoading} onClick={() => { setGuestChoiceOpen(false); void handleGuestLogin(); }}>Retry guest sign-in with recovery</Button>}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isLoading}>Cancel</AlertDialogCancel>
+            <Button type="button" variant="outline" disabled={isLoading} onClick={() => setNewGuestConfirmationOpen(true)}>Create a new account</Button>
+            <Button type="button" disabled={isLoading} onClick={() => void handleRecoverGuest()}>{isLoading ? <Loader2 className="size-4 animate-spin" /> : "Continue with existing account"}</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={newGuestConfirmationOpen} onOpenChange={(open) => { if (!isLoading) setNewGuestConfirmationOpen(open); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Create a separate Focus Rewards account?</AlertDialogTitle>
+            <AlertDialogDescription>This creates a new guest account with separate data. Your existing account and its approval status remain unchanged. You can recover the new account only while its recovery credential stays saved in this browser.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isLoading}>Go back</AlertDialogCancel>
+            <Button type="button" disabled={isLoading} onClick={() => void handleCreateSeparateGuest()}>{isLoading ? <Loader2 className="size-4 animate-spin" /> : "Confirm new account"}</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <footer className="auth-footer">FOCUS FIRST <i /> ENJOY IT AFTER</footer>
     </div>
   );

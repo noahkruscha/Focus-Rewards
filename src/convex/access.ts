@@ -86,6 +86,12 @@ async function hashCode(code: string) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+async function hashGuestRecoveryCredential(credential: string) {
+  const bytes = new TextEncoder().encode(`focus-rewards:guest-recovery:v1:${credential}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function hashSecret(purpose: "extension-pair" | "extension-session", secret: string) {
   const bytes = new TextEncoder().encode(`focus-rewards:${purpose}:v1:${secret}`);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -125,7 +131,7 @@ export const status = query({
   args: {},
   handler: async (ctx) => {
     const userId = await getAuthUserId(ctx);
-    if (userId === null) return { authenticated: false, approved: false, onboardingComplete: false, administrator: false, canClaimInitialAdministrator: false, approvalRequired: approvalRequired() };
+    if (userId === null) return { authenticated: false, approved: false, guestAccount: false, onboardingComplete: false, requesterName: null, administrator: false, canClaimInitialAdministrator: false, approvalRequired: approvalRequired() };
     const user = await ctx.db.get(userId);
     const access = await accessFor(ctx, userId);
     const approved = !approvalRequired() || access?.status === "approved";
@@ -137,7 +143,9 @@ export const status = query({
     return {
       authenticated: true,
       approved,
+      guestAccount: user?.isAnonymous === true,
       onboardingComplete: hasCompletedProfile(user),
+      requesterName: access?.requesterName && validRequesterName(access.requesterName) ? access.requesterName.trim() : null,
       administrator: approved && user?.role === "admin",
       canClaimInitialAdministrator,
       approvalRequired: approvalRequired(),
@@ -177,6 +185,32 @@ export const storeExtensionPairingCode = internalMutation({
       }
     }
     await ctx.db.insert("extensionPairingCodes", { codeHash: args.codeHash, userId, createdAt: args.now, expiresAt: args.expiresAt });
+  },
+});
+
+
+
+export const registerGuestRecoveryCredential = mutation({
+  args: { credential: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await signedInUserId(ctx);
+    const user = await ctx.db.get(userId);
+    if (!user?.isAnonymous) throw new ConvexError("Guest account recovery can only be enabled for the signed-in guest account.");
+    if (!/^[A-Za-z0-9_-]{43}$/.test(args.credential)) throw new ConvexError("Invalid guest recovery credential.");
+    const providerAccountId = await hashGuestRecoveryCredential(args.credential);
+    const matchingCredential = await ctx.db.query("authAccounts")
+      .withIndex("providerAndAccountId", (q) => q.eq("provider", "guest-recovery").eq("providerAccountId", providerAccountId))
+      .unique();
+    if (matchingCredential) {
+      if (matchingCredential.userId === userId) return { registered: true };
+      throw new ConvexError("This recovery credential is already linked to another account.");
+    }
+    const existingCredential = await ctx.db.query("authAccounts")
+      .withIndex("userIdAndProvider", (q) => q.eq("userId", userId).eq("provider", "guest-recovery"))
+      .collect();
+    if (existingCredential.some((account) => account.providerAccountId === providerAccountId)) return { registered: true };
+    await ctx.db.insert("authAccounts", { userId, provider: "guest-recovery", providerAccountId });
+    return { registered: true };
   },
 });
 
