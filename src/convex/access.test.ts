@@ -5,7 +5,13 @@ import schema from "./schema";
 import { api } from "./_generated/api";
 import type { Doc } from "./_generated/dataModel";
 
-const modules = import.meta.glob("./**/*.*s");
+const modules = {
+  "./_generated/api.js": () => import("./_generated/api.js"),
+  "./_generated/server.js": () => import("./_generated/server.js"),
+  "./access.ts": () => import("./access"),
+  "./rewards.ts": () => import("./rewards"),
+  "./users.ts": () => import("./users"),
+};
 const ADMIN_EMAIL = "owner@example.com";
 
 function createTest() {
