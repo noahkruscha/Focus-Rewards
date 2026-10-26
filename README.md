@@ -291,3 +291,44 @@ When using convex, make sure:
 - This includes importing generated files like `@/convex/_generated/server`, `@/convex/_generated/api`
 - Remember to import functions like useQuery, useMutation, useAction, etc. from `convex/react`
 - NEVER have return type validators.
+
+# Private Beta Access and Security
+
+Focus Rewards temporarily requires explicit backend approval for all rewards functionality. The restriction is deliberately configurable and is enforced in Convex, not by the frontend. The existing `/auth` flow remains unchanged: Convex Auth provides email OTP and anonymous sign-in. `getAuthUserId(ctx)` obtains the user ID from the authenticated server identity; no client-supplied user ID is used as the current account.
+
+## Configure the initial administrator
+
+1. In the Convex dashboard, select and confirm the intended existing **development** deployment. The noted URL `https://useful-firefly-508.eu-west-1.convex.cloud` was a development URL and must not be assumed to be production.
+2. In its **Settings → Environment Variables**, set `BETA_REQUIRE_APPROVAL=true`, `BETA_INVITATIONS_ENABLED=true`, and `BETA_ADMIN_EMAIL` to the exact email on your existing account. Keep `AUTH_RESEND_KEY`, `AUTH_EMAIL_FROM`, `CONVEX_SITE_URL`, and the other existing auth settings configured as required. These are Convex server variables, never `VITE_` variables.
+3. Deploy the backend to that selected development deployment through the authenticated Convex dashboard/CLI. No website deployment is part of these steps.
+4. Sign in to the existing account through the normal email OTP page. The approval screen offers **Configure this existing account as administrator** only when the server-verified email matches `BETA_ADMIN_EMAIL`. Use it once; it sets the role and approval record on the same user and does not reset account data.
+5. Open `/admin` to manage beta accounts.
+
+This bootstrap checks the authenticated Convex Auth user and the server-side configured email; it does not guess a user ID or grant admin to the first registrant. Remove `BETA_ADMIN_EMAIL` after initial setup to disable this bootstrap path. Do not change or recreate your existing account.
+
+## Invite and approve a friend
+
+Your friend signs up/signs in through the existing email OTP flow, then opens the approval screen while signed in with the invited email. On `/admin`, enter that exact email and create an invitation. Convex generates 192-bit random codes using Web Crypto, persists only a SHA-256 hash, and binds each code to the normalized recipient email. Invitations expire after seven days, are single-use, and at most ten outstanding invitations per administrator are permitted. Share a code privately (never as a URL or in source/logs). A recipient must have a verified email matching the invitation to claim it. As an alternative, `/admin` lets you approve a signed-in account directly, without an email allowlist or manual database edits.
+
+To revoke access, use `/admin` → **Revoke**. This immediately blocks future protected Convex operations and retains all the user's account data. Use **Revoke code** to invalidate an unclaimed invitation. The current administrator cannot revoke their own approval in the UI; keep a second trusted administrator or use the Convex dashboard for recovery. Anonymous accounts cannot claim invitations or be approved.
+
+## Pause invitations or remove the beta gate later
+
+- Pause new invitations by setting Convex deployment variable `BETA_INVITATIONS_ENABLED=false`. Existing invitations remain claimable until used, revoked, or expired. Set it to `true` to resume.
+- When opening registration, set `BETA_REQUIRE_APPROVAL=false` in each intended Convex deployment using trusted deployment/dashboard access. This is the sole bypass; it is not exposed to clients. Authentication remains mandatory and per-user authorization/data scoping remain in force. Set it to `true` to restore approval checks.
+- Do not delete the `betaAccess` table or user/reward data when the temporary restriction is lifted. Keeping it is safe and makes re-enabling the gate reversible. No account, wallet, task, reward, or transaction migration is needed.
+- `BETA_REQUIRE_APPROVAL` defaults to required (fail-closed); `BETA_INVITATIONS_ENABLED` defaults to enabled. Never change these from browser code.
+
+## Protection and limitations
+
+All public reward queries and mutations use the shared approved-authenticated-user guard. The current-user profile query is also approval-gated while beta mode is on, with a narrow bootstrap exception for the configured verified administrator email so the existing account can load and complete one-time setup. That exception exposes only the current profile query; reward data remains blocked until approval. Auth framework HTTP endpoints remain limited to signing in/out. Database reads/writes are scoped to the server-derived user ID; task ownership, fixed reward catalog prices, balance sufficiency, and atomic wallet transactions remain backend-enforced. Convex mutations are transactional; transaction idempotency and purchase-per-reward checks prevent ordinary duplicate/replay purchases. Existing authenticated users and data are preserved by the bootstrap and revocation operations.
+
+The extension currently only estimates YouTube video values. It has no authenticated pairing, purchase, or server unlock API in this repository. Therefore an estimate is not an unlock and cannot spend coins. A secure extension backend (short-lived single-use pairing, approved-user checks, expiring/revocable scoped credential, authoritative unlock response, and server-confirmed atomic purchase) is still required before adding protected extension actions. No website session token or client-side unlock flag can substitute for it.
+
+No deployment has been performed. Production deployment configuration, OTP delivery, the live existing account, multi-account production isolation, and the Cloudflare Pages state were not verifiable from this workspace. The public website must remain offline until you separately authorize redeployment. Do not commit `.env` or secret values.
+
+### Security checks
+
+- `bunx vitest run src/convex/access.test.ts` tests admin bootstrap and account preservation, unauthenticated/unauthorized operations, unapproved blocking, recipient binding, invitation expiry/revocation/single-use/hash-at-rest, approved access, data isolation, and revocation.
+- `node --test extension/tests/*.test.js` runs existing extension metadata/pricing tests.
+- `bun run build` is the TypeScript and production Vite build; `bun run lint` runs ESLint.

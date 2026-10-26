@@ -93,6 +93,25 @@ const schema = defineSchema(
       purchasedAt: v.number(),
       idempotencyKey: v.string(),
     }).index("by_user", ["userId"]).index("by_user_reward", ["userId", "rewardId"]).index("by_user_idempotency", ["userId", "idempotencyKey"]),
+
+    betaAccess: defineTable({
+      userId: v.id("users"),
+      status: v.union(v.literal("pending"), v.literal("approved"), v.literal("revoked")),
+      requestedAt: v.number(),
+      updatedAt: v.number(),
+      updatedBy: v.optional(v.id("users")),
+    }).index("by_user", ["userId"]).index("by_status", ["status"]),
+
+    betaInvitations: defineTable({
+      codeHash: v.string(),
+      recipientEmail: v.string(),
+      createdBy: v.id("users"),
+      createdAt: v.number(),
+      expiresAt: v.number(),
+      revokedAt: v.optional(v.number()),
+      usedAt: v.optional(v.number()),
+      claimedBy: v.optional(v.id("users")),
+    }).index("by_hash", ["codeHash"]).index("by_creator_time", ["createdBy", "createdAt"]),
   },
   {
     schemaValidation: false,

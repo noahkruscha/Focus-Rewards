@@ -1,4 +1,4 @@
-import { getAuthUserId } from "@convex-dev/auth/server";
+import { requireApprovedUser } from "./access";
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
@@ -13,9 +13,7 @@ const LEGACY_TRANSACTION_TYPES = {
 } as const;
 
 async function authenticatedUserId(ctx: QueryCtx | MutationCtx) {
-  const userId = await getAuthUserId(ctx);
-  if (userId === null) throw new ConvexError("Sign in to access your Focus Rewards data.");
-  return userId;
+  return await requireApprovedUser(ctx);
 }
 
 async function accountFor(ctx: QueryCtx | MutationCtx, userId: Id<"users">) {
