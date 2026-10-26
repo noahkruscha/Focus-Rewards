@@ -1,4 +1,4 @@
-import { requireAdministrator, requireApprovedUser } from "./access";
+import { accessFor, requireAdministrator, requireApprovedUser } from "./access";
 import { ConvexError, v } from "convex/values";
 import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
@@ -23,11 +23,12 @@ function youtubeUnlockPrice() {
 }
 
 function hasCompletedProfile(user: { displayName?: string; name?: string }) {
-  const name = user.displayName ?? user.name;
-  return Boolean(name && name.trim() && name.trim().length <= 40 && Array.from(name).every((character) => {
-    const point = character.codePointAt(0) ?? 0;
-    return point > 31 && (point < 127 || point > 159);
-  }));
+  return [user.displayName, user.name].some((name) => Boolean(
+    name && name.trim() && name.trim().length <= 40 && Array.from(name).every((character) => {
+      const point = character.codePointAt(0) ?? 0;
+      return point > 31 && (point < 127 || point > 159);
+    }),
+  ));
 }
 
 function validateYouTubePurchaseDetails(videoId: string, contentType: string, durationSeconds: number) {
@@ -316,7 +317,7 @@ export const youtubePurchaseQuote = internalQuery({
     const user = await ctx.db.get(session.userId);
     if (!user || user.isAnonymous || !hasCompletedProfile(user)) throw new ConvexError("Extension session is expired or revoked.");
     if (process.env.BETA_REQUIRE_APPROVAL !== "false") {
-      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+      const access = await accessFor(ctx, session.userId);
       if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
     }
     validateYouTubePurchaseDetails(args.videoId, args.contentType, args.durationSeconds);
@@ -331,7 +332,7 @@ export const verifyYouTubeEntitlement = internalQuery({
     if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) return null;
     const user = await ctx.db.get(session.userId);
     if (!user || user.isAnonymous || !hasCompletedProfile(user)) return null;
-    const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+    const access = await accessFor(ctx, session.userId);
     if (process.env.BETA_REQUIRE_APPROVAL !== "false" && access?.status !== "approved") return null;
     const entitlements = await ctx.db.query("libraryPurchases")
       .withIndex("by_user_content", (q) => q.eq("userId", session.userId).eq("contentType", args.contentType).eq("contentId", args.videoId))
@@ -378,7 +379,7 @@ export const purchaseYouTubeReward = internalMutation({
     const user = await ctx.db.get(session.userId);
     if (!user || user.isAnonymous) throw new ConvexError("Extension session is expired or revoked.");
     if (process.env.BETA_REQUIRE_APPROVAL !== "false") {
-      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+      const access = await accessFor(ctx, session.userId);
       if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
     }
     if (!hasCompletedProfile(user)) throw new ConvexError("Complete your profile setup to continue.");

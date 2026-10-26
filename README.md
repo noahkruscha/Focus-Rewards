@@ -306,11 +306,13 @@ Focus Rewards temporarily requires explicit backend approval for all rewards fun
 
 This bootstrap checks the authenticated Convex Auth user and the server-side configured email; it does not guess a user ID or grant admin to the first registrant. Remove `BETA_ADMIN_EMAIL` after initial setup to disable this bootstrap path. Do not change or recreate your existing account.
 
-## Invite and approve a friend
+## Grant access to a friend
 
-Your friend signs up/signs in through the existing email OTP flow, then opens the approval screen while signed in with the invited email. On `/admin`, enter that exact email and create an invitation. Convex generates 192-bit random codes using Web Crypto, persists only a SHA-256 hash, and binds each code to the normalized recipient email. Invitations expire after seven days, are single-use, and at most ten outstanding invitations per administrator are permitted. Share a code privately (never as a URL or in source/logs). A recipient must have a verified email matching the invitation to claim it. As an alternative, `/admin` lets you approve a signed-in account directly, without an email allowlist or manual database edits.
+In `/admin`, **Approve by email** pre-approves an address, including one whose owner has not signed in yet. Access takes effect only after the owner signs in with Convex Auth and verifies that email. You may revoke and restore that email-level permission under the same section; the server links it only to a matching verified account and invalidates extension sessions when revoked.
 
-To revoke access, use `/admin` → **Revoke**. This immediately blocks future protected Convex operations and retains all the user's account data. Use **Revoke code** to invalidate an unclaimed invitation. The current administrator cannot revoke their own approval in the UI; keep a second trusted administrator or use the Convex dashboard for recovery. Anonymous accounts cannot claim invitations or be approved.
+In **Invitation Codes**, create a single-use code. Leave the optional recipient email blank to make a shareable code for someone using **Continue without an email** (a guest account), or provide an email to bind the code to that verified email. Codes have 192 bits of randomness, are stored only as SHA-256 hashes, expire within seven days by default (up to 90 days), and at most ten outstanding codes per administrator are permitted. Share codes privately, never in URLs, source, or logs. A signed-in user enters the code at the beta-approval screen, and the server atomically claims it once. The invitation grants beta access only; it never assigns an administrator role.
+
+A guest or email account can instead submit a manual approval request from the beta-approval screen. The requester must enter a name; the request is linked to that server-authenticated account, and administrators see the entered name under **User Access** before approving or revoking it. Access checks are enforced server-side. The initial administrator cannot revoke their own access; use another trusted administrator for recovery.
 
 ## Pause invitations or remove the beta gate later
 

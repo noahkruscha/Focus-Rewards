@@ -21,6 +21,7 @@ import { ArrowRight, Coins, Loader2, LockKeyhole, Mail, UserX, Zap, Ticket } fro
 import { Suspense, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
+import { toast } from "sonner";
 
 interface AuthProps {
   redirectAfterAuth?: string;
@@ -69,7 +70,9 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
       if (!cancelled) navigate(redirect, { replace: true });
     }).catch((claimError: unknown) => {
       if (cancelled) return;
-      setError(claimError instanceof Error ? claimError.message : "The invitation could not be claimed.");
+      const message = claimError instanceof Error ? claimError.message : "The invitation could not be claimed.";
+      setError(message);
+      toast.error(message);
       setPendingInvitationCode(null);
       invitationClaimRef.current = null;
       navigate(redirect, { replace: true });
@@ -83,6 +86,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     try {
       const formData = new FormData(event.currentTarget);
       const email = String(formData.get("email") ?? "").trim().toLowerCase();
+      formData.set("email", email);
       if (signupMode) {
         const result = await validateInvitation({ code: invitationCode, email });
         if (!result.valid) throw new Error("That invitation is invalid, expired, revoked, used, or intended for another email.");
@@ -111,7 +115,8 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
       await signIn("email-otp", formData);
       if (!pendingInvitationCode) navigate(redirect);
     } catch (error) {
-      setPendingInvitationCode(null);
+      // Keep the invitation in memory so an incorrect OTP attempt can be retried.
+      // It is only claimed after Convex Auth establishes the verified session.
       setError(error instanceof Error ? error.message : "The verification code you entered is incorrect.");
       setIsLoading(false);
 
@@ -256,7 +261,8 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                     <Button
                       variant="link"
                       className="p-0 h-auto"
-                      onClick={() => { setPendingInvitationCode(null); setStep("signIn"); }}
+                      type="button"
+                      onClick={() => { setPendingInvitationCode(null); invitationClaimRef.current = null; setStep("signIn"); setOtp(""); setError(null); }}
                     >
                       Try again
                     </Button>

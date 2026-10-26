@@ -32,16 +32,31 @@ async function signedInUserId(ctx: QueryCtx | MutationCtx) {
   return userId;
 }
 
-async function accessFor(ctx: QueryCtx | MutationCtx, userId: Id<"users">) {
-  return await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+export async function accessFor(ctx: QueryCtx | MutationCtx, userId: Id<"users">) {
+  const user = await ctx.db.get(userId);
+  const linkedAccess = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+  if (linkedAccess) return linkedAccess;
+  if (!user?.email || !user.emailVerificationTime || user.isAnonymous) return null;
+  const email = user.email.trim().toLowerCase();
+  const emailAccess = await ctx.db.query("betaAccess").withIndex("by_email", (q) => q.eq("email", email)).unique();
+  return emailAccess && (!emailAccess.userId || emailAccess.userId === userId) ? emailAccess : null;
+}
+
+function validRequesterName(value: string) {
+  const name = value.trim();
+  return name.length > 0 && name.length <= 40 && Array.from(name).every((character) => {
+    const point = character.codePointAt(0) ?? 0;
+    return point > 31 && (point < 127 || point > 159);
+  });
 }
 
 function hasCompletedProfile(user: { displayName?: string; name?: string } | null) {
-  const name = user?.displayName ?? user?.name;
-  return Boolean(name && name.trim() && name.trim().length <= 40 && Array.from(name).every((character) => {
-    const point = character.codePointAt(0) ?? 0;
-    return point > 31 && (point < 127 || point > 159);
-  }));
+  return [user?.displayName, user?.name].some((name) => Boolean(
+    name && name.trim() && name.trim().length <= 40 && Array.from(name).every((character) => {
+      const point = character.codePointAt(0) ?? 0;
+      return point > 31 && (point < 127 || point > 159);
+    }),
+  ));
 }
 
 export async function requireApprovedUser(ctx: QueryCtx | MutationCtx) {
@@ -89,6 +104,19 @@ function normalizeInvitationCode(code: string) {
   return /^[A-Fa-f0-9]{48}$/.test(compact) ? compact.toUpperCase() : trimmed;
 }
 
+function normalizeEmailAddress(value: string) {
+  const email = value.trim().toLowerCase();
+  if (email.length > 254) return null;
+  const at = email.indexOf("@");
+  if (at <= 0 || at !== email.lastIndexOf("@") || at > 64) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (!/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$/i.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..")) return null;
+  const labels = domain.split(".");
+  if (labels.length < 2 || labels.some((label) => label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label))) return null;
+  return email;
+}
+
 function invitationCodeLabel(code: string) {
   return `••••${code.slice(-4)}`;
 }
@@ -97,23 +125,25 @@ export const status = query({
   args: {},
   handler: async (ctx) => {
     const userId = await getAuthUserId(ctx);
-    if (userId === null) return { authenticated: false, approved: false, onboardingComplete: false, administrator: false, approvalRequired: approvalRequired() };
+    if (userId === null) return { authenticated: false, approved: false, onboardingComplete: false, administrator: false, canClaimInitialAdministrator: false, approvalRequired: approvalRequired() };
     const user = await ctx.db.get(userId);
     const access = await accessFor(ctx, userId);
     const approved = !approvalRequired() || access?.status === "approved";
     const configuredAdminEmail = process.env.BETA_ADMIN_EMAIL?.trim().toLowerCase();
+    const canClaimInitialAdministrator = Boolean(
+      user?.email && !user.isAnonymous && !user.role && user.emailVerificationTime &&
+      access?.status !== "revoked" && configuredAdminEmail === user.email.toLowerCase()
+    );
     return {
       authenticated: true,
       approved,
       onboardingComplete: hasCompletedProfile(user),
       administrator: approved && user?.role === "admin",
-      canClaimInitialAdministrator: Boolean(
-        !access && user?.email && !user.isAnonymous && user.emailVerificationTime &&
-        configuredAdminEmail === user.email.toLowerCase()
-      ),
+      canClaimInitialAdministrator,
       approvalRequired: approvalRequired(),
       status: access?.status ?? "pending",
-    };  },
+    };
+  },
 });
 
 
@@ -151,28 +181,31 @@ export const storeExtensionPairingCode = internalMutation({
 });
 
 export const requestApproval = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { requesterName: v.string() },
+  handler: async (ctx, args) => {
     const userId = await signedInUserId(ctx);
+    if (!validRequesterName(args.requesterName)) throw new ConvexError("Enter a name between 1 and 40 characters without control characters.");
+    const user = await ctx.db.get(userId);
+    if (!user) throw new ConvexError("Account not found.");
     const existing = await accessFor(ctx, userId);
     if (existing?.status === "approved") return { approved: true };
-    if (!existing) {
-      const now = Date.now();
-      await ctx.db.insert("betaAccess", { userId, status: "pending", requestedAt: now, updatedAt: now });
-    }
-    return { approved: false };  },
+    if (existing?.status === "revoked") throw new ConvexError("Your access was revoked. Contact the administrator.");
+    const now = Date.now();
+    const email = user.email && user.emailVerificationTime && !user.isAnonymous ? normalizeEmailAddress(user.email) ?? undefined : undefined;
+    if (existing) await ctx.db.patch(existing._id, { userId, email: email ?? existing.email, requesterName: args.requesterName.trim(), updatedAt: now });
+    else await ctx.db.insert("betaAccess", { userId, ...(email ? { email } : {}), status: "pending", requestedAt: now, updatedAt: now, requesterName: args.requesterName.trim() });
+    return { approved: false };
+  },
 });
 
 
 
 export const createInvitation = action({
-  args: { recipientEmail: v.string(), expiresAt: v.optional(v.number()) },
+  args: { recipientEmail: v.optional(v.string()), expiresAt: v.optional(v.number()) },
   handler: async (ctx, args): Promise<{ code: string; expiresAt: number }> => {
     if (!invitationsEnabled()) throw new ConvexError("New invitations are temporarily disabled.");
-    const recipientEmail = args.recipientEmail.trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail) || recipientEmail.length > 254) {
-      throw new ConvexError("Enter a valid email address for the invited account.");
-    }
+    const recipientEmail = args.recipientEmail ? normalizeEmailAddress(args.recipientEmail) : undefined;
+    if (args.recipientEmail && !recipientEmail) throw new ConvexError("Enter a valid email address for the invited account.");
     const adminId = await ctx.runQuery(internal.access.assertAdministrator, {});
     const now = Date.now();
     const expiresAt = args.expiresAt ?? now + INVITATION_LIFETIME_MS;
@@ -184,24 +217,23 @@ export const createInvitation = action({
     const code = Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
     const codeHash = await hashCode(code);
     const label = invitationCodeLabel(code);
-    await ctx.runMutation(internal.access.storeInvitation, { codeHash, recipientEmail, expiresAt, adminId, label });
-    return { code, expiresAt };  },
+    await ctx.runMutation(internal.access.storeInvitation, { codeHash, ...(recipientEmail ? { recipientEmail } : {}), expiresAt, adminId, label });
+    return { code, expiresAt };
+  },
 });
 
 
 
 export const validateInvitation = mutation({
-  args: { code: v.string(), email: v.string() },
+  args: { code: v.string(), email: v.optional(v.string()) },
   handler: async (ctx, args) => {
     if (!approvalRequired() || !invitationsEnabled()) return { valid: false };
     const normalizedCode = normalizeInvitationCode(args.code);
     if (!(/^[A-F0-9]{48}$/.test(normalizedCode) || /^[A-Za-z0-9_-]{32}$/.test(normalizedCode))) return { valid: false };
-    const email = args.email.trim().toLowerCase();
-    const at = email.indexOf("@");
-    if (at <= 0 || at !== email.lastIndexOf("@") || email.length > 254 || !email.slice(at + 1).includes(".")) return { valid: false };
     const codeHash = await hashCode(normalizedCode);
     const invitation = await ctx.db.query("betaInvitations").withIndex("by_hash", (q) => q.eq("codeHash", codeHash)).unique();
-    return { valid: Boolean(invitation && invitation.recipientEmail === email && invitation.usedAt === undefined && invitation.revokedAt === undefined && invitation.expiresAt > Date.now()) };
+    const email = args.email ? normalizeEmailAddress(args.email) : null;
+    return { valid: Boolean(invitation && invitation.usedAt === undefined && invitation.revokedAt === undefined && invitation.expiresAt > Date.now() && (!invitation.recipientEmail || invitation.recipientEmail === email)) };
   },
 });
 
@@ -223,15 +255,19 @@ export const claimInvitation = mutation({
       throw new ConvexError("Invitation code is invalid, expired, revoked, or already used.");
     }
     const user = await ctx.db.get(userId);
-    if (!user?.email || user.isAnonymous || !user.emailVerificationTime || user.email.toLowerCase() !== invitation.recipientEmail) {
+    if (!user) throw new ConvexError("Account not found.");
+    if (invitation.recipientEmail && (!user.email || user.isAnonymous || !user.emailVerificationTime || user.email.toLowerCase() !== invitation.recipientEmail)) {
       throw new ConvexError("This invitation is for a different verified email account.");
     }
     const access = await accessFor(ctx, userId);
     if (access?.status === "approved") throw new ConvexError("This account already has beta access; the invitation was not used.");
-    if (access) await ctx.db.patch(access._id, { status: "approved", updatedAt: now, approvedAt: now, invitationId: invitation._id, invitationCodeLabel: invitation.codeLabel });
-    else await ctx.db.insert("betaAccess", { userId, status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, invitationId: invitation._id, invitationCodeLabel: invitation.codeLabel });
+    if (access?.status === "revoked") throw new ConvexError("This account's beta access was revoked; an administrator must restore it manually.");
+    const verifiedEmail = user.email && user.emailVerificationTime && !user.isAnonymous ? normalizeEmailAddress(user.email) : null;
+    if (access) await ctx.db.patch(access._id, { userId, ...(verifiedEmail ? { email: verifiedEmail } : {}), status: "approved", updatedAt: now, approvedAt: now, invitationId: invitation._id, invitationCodeLabel: invitation.codeLabel });
+    else await ctx.db.insert("betaAccess", { userId, ...(verifiedEmail ? { email: verifiedEmail } : {}), status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, invitationId: invitation._id, invitationCodeLabel: invitation.codeLabel });
     await ctx.db.patch(invitation._id, { usedAt: now, claimedBy: userId });
-    return { approved: true };  },
+    return { approved: true };
+  },
 });
 
 
@@ -325,25 +361,29 @@ export const adminOverview = query({
       ctx.db.query("betaAccess").collect(),
       ctx.db.query("betaInvitations").collect(),
     ]);
-    const statusByUser = new Map(accessRecords.map((entry) => [entry.userId, entry.status]));
+    const statusByUser = new Map(accessRecords.filter((entry) => entry.userId).map((entry) => [entry.userId!, entry.status]));
     const userById = new Map(users.map((user) => [user._id, user]));
     return {
       invitationsEnabled: invitationsEnabled(),
       users: users.map((user) => {
-        const access = accessRecords.find((entry) => entry.userId === user._id);
+        const normalizedEmail = user.email?.trim().toLowerCase();
+        const access = accessRecords.find((entry) => entry.userId === user._id) ??
+          (normalizedEmail && user.emailVerificationTime && !user.isAnonymous
+            ? accessRecords.find((entry) => !entry.userId && entry.email === normalizedEmail)
+            : undefined);
         return {
           userId: user._id,
           email: user.email ?? null,
           name: user.displayName ?? user.name ?? null,
+          requesterName: access?.requesterName ?? null,
           createdAt: user._creationTime,
           anonymous: user.isAnonymous ?? false,
           role: user.role ?? null,
-          status: statusByUser.get(user._id) ?? "pending",
+          status: access?.status ?? statusByUser.get(user._id) ?? "pending",
           invited: access?.invitationId !== undefined,
           requestedAt: access?.requestedAt ?? null,
           approvedAt: access?.approvedAt ?? null,
           updatedAt: access?.updatedAt ?? null,
-          invitationId: access?.invitationId ?? null,
           invitationCodeLabel: access?.invitationCodeLabel ?? null,
         };
       }),
@@ -352,6 +392,13 @@ export const adminOverview = query({
         redeemed: invitations.filter((item) => item.usedAt !== undefined).length,
       },
       pendingCount: accessRecords.filter((item) => item.status === "pending").length,
+      emailAccess: accessRecords.filter((record) => record.email).map((record) => ({
+        email: record.email!,
+        userId: record.userId ?? null,
+        status: record.status,
+        updatedAt: record.updatedAt,
+        approvedAt: record.approvedAt ?? null,
+      })),
       invitations: invitations.map(({ _id, recipientEmail, expiresAt, revokedAt, usedAt, createdAt, claimedBy, codeLabel }) => {
         const redeemedUser = claimedBy ? userById.get(claimedBy) : undefined;
         return {
@@ -362,16 +409,89 @@ export const adminOverview = query({
           revoked: revokedAt !== undefined,
           used: usedAt !== undefined,
           usedAt: usedAt ?? null,
-          claimedBy: claimedBy ?? null,
           redeemedBy: redeemedUser ? { name: redeemedUser.displayName ?? redeemedUser.name ?? null, email: redeemedUser.email ?? null } : null,
           createdAt,
           status: revokedAt !== undefined ? "revoked" as const : usedAt !== undefined ? "redeemed" as const : expiresAt <= Date.now() ? "expired" as const : "available" as const,
         };
       }),
-    };  },
+    };
+  },
 });
 
 
+
+export const restoreUserAccess = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    if (!approvalRequired()) throw new ConvexError("Manual beta approval is disabled for this deployment.");
+    const adminId = await requireAdministrator(ctx);
+    const user = await ctx.db.get(args.userId);
+    if (!user || user.isAnonymous || !user.email || !user.emailVerificationTime) throw new ConvexError("A verified email account is required.");
+    const existing = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", args.userId)).unique();
+    if (!existing || existing.status !== "revoked") throw new ConvexError("This account has no revoked access to restore.");
+    const now = Date.now();
+    await ctx.db.patch(existing._id, { status: "approved", updatedAt: now, approvedAt: now, updatedBy: adminId });
+  },
+});
+
+export const approveEmail = mutation({
+  args: { email: v.string() },
+  handler: async (ctx, args) => {
+    if (!approvalRequired()) throw new ConvexError("Manual beta approval is disabled for this deployment.");
+    const adminId = await requireAdministrator(ctx);
+    const email = normalizeEmailAddress(args.email);
+    if (!email) throw new ConvexError("Enter a valid email address.");
+    const matches = (await ctx.db.query("users").collect())
+      .filter((user) => normalizeEmailAddress(user.email ?? "") === email && user.emailVerificationTime && !user.isAnonymous);
+    if (matches.length > 1) throw new ConvexError("Multiple verified accounts use this email; contact support.");
+    const now = Date.now();
+    if (matches.length === 1) {
+      const user = matches[0];
+      const linked = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", user._id)).unique();
+      const emailRecord = await ctx.db.query("betaAccess").withIndex("by_email", (q) => q.eq("email", email)).unique();
+      const existing = linked ?? (emailRecord?.userId === undefined || emailRecord.userId === user._id ? emailRecord : undefined);
+      if (linked?.status === "revoked") throw new ConvexError("This account access was revoked. Restore it from User Access.");
+      if (emailRecord?.userId && emailRecord.userId !== user._id) throw new ConvexError("This email is already linked to another account.");
+      if (existing) await ctx.db.patch(existing._id, { userId: user._id, email, status: "approved", updatedAt: now, approvedAt: now, updatedBy: adminId, invitationId: undefined, invitationCodeLabel: undefined });
+      else await ctx.db.insert("betaAccess", { userId: user._id, email, status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, updatedBy: adminId });
+      return { linked: true };
+    }
+    const existing = await ctx.db.query("betaAccess").withIndex("by_email", (q) => q.eq("email", email)).unique();
+    if (existing?.userId) throw new ConvexError("This email is already linked to another account.");
+    if (existing) await ctx.db.patch(existing._id, { status: "approved", updatedAt: now, approvedAt: now, updatedBy: adminId });
+    else await ctx.db.insert("betaAccess", { email, status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, updatedBy: adminId });
+    return { linked: false };
+  },
+});
+
+export const revokeEmailAccess = mutation({
+  args: { email: v.string() },
+  handler: async (ctx, args) => {
+    if (!approvalRequired()) throw new ConvexError("Manual beta approval is disabled for this deployment.");
+    const adminId = await requireAdministrator(ctx);
+    const email = normalizeEmailAddress(args.email);
+    if (!email) throw new ConvexError("Enter a valid email address.");
+    const matches = (await ctx.db.query("users").collect())
+      .filter((user) => normalizeEmailAddress(user.email ?? "") === email && user.emailVerificationTime && !user.isAnonymous);
+    if (matches.some((user) => user._id === adminId)) throw new ConvexError("Use a different administrator account to revoke your own access.");
+    if (matches.length > 1) throw new ConvexError("Multiple verified accounts use this email; contact support.");
+    const linked = matches[0]
+      ? await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", matches[0]._id)).unique()
+      : null;
+    const emailRecord = await ctx.db.query("betaAccess").withIndex("by_email", (q) => q.eq("email", email)).unique();
+    const existing = linked ?? (emailRecord?.userId === undefined || emailRecord.userId === matches[0]?._id ? emailRecord : undefined);
+    if (!existing || existing.status === "revoked") return;
+    const now = Date.now();
+    const userId = matches[0]?._id ?? existing.userId;
+    await ctx.db.patch(existing._id, { status: "revoked", updatedAt: now, updatedBy: adminId, email, ...(userId ? { userId } : {}) });
+    if (userId) {
+      const pairingCodes = await ctx.db.query("extensionPairingCodes").withIndex("by_user", (q) => q.eq("userId", userId)).collect();
+      for (const code of pairingCodes) if (code.revokedAt === undefined && code.usedAt === undefined) await ctx.db.patch(code._id, { revokedAt: now });
+      const sessions = await ctx.db.query("extensionSessions").withIndex("by_user", (q) => q.eq("userId", userId)).collect();
+      for (const session of sessions) if (session.revokedAt === undefined) await ctx.db.patch(session._id, { revokedAt: now });
+    }
+  },
+});
 
 export const approveUser = mutation({
   args: { userId: v.id("users") },
@@ -380,11 +500,14 @@ export const approveUser = mutation({
     const adminId = await requireAdministrator(ctx);
     const user = await ctx.db.get(args.userId);
     if (!user) throw new ConvexError("User not found.");
-    if (!user.email || user.isAnonymous || !user.emailVerificationTime) throw new ConvexError("Only accounts with a verified email can be approved.");
     const existing = await accessFor(ctx, args.userId);
+    const guestRequest = Boolean(user.isAnonymous && existing?.status === "pending" && existing.requesterName?.trim());
+    if ((!user.email || !user.emailVerificationTime || user.isAnonymous) && !guestRequest) throw new ConvexError("Only verified email accounts or named guest requests can be approved.");
     const now = Date.now();
-    if (existing) await ctx.db.patch(existing._id, { status: "approved", updatedAt: now, approvedAt: now, invitationId: undefined, invitationCodeLabel: undefined, updatedBy: adminId });
-    else await ctx.db.insert("betaAccess", { userId: args.userId, status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, updatedBy: adminId });  },
+    const email = user.email && user.emailVerificationTime && !user.isAnonymous ? normalizeEmailAddress(user.email) : undefined;
+    if (existing) await ctx.db.patch(existing._id, { userId: args.userId, ...(email ? { email } : {}), status: "approved", updatedAt: now, approvedAt: now, invitationId: undefined, invitationCodeLabel: undefined, updatedBy: adminId });
+    else await ctx.db.insert("betaAccess", { userId: args.userId, ...(email ? { email } : {}), status: "approved", requestedAt: now, updatedAt: now, approvedAt: now, updatedBy: adminId });
+  },
 });
 
 
@@ -415,12 +538,12 @@ export const revokeUser = mutation({
 export const revokeInvitation = mutation({
   args: { invitationId: v.id("betaInvitations") },
   handler: async (ctx, args) => {
-    const adminId = await requireAdministrator(ctx);
+    await requireAdministrator(ctx);
     const invitation = await ctx.db.get(args.invitationId);
-    if (invitation && invitation.createdBy !== adminId) throw new ConvexError("Invitation not found.");
     if (invitation && invitation.revokedAt === undefined && invitation.usedAt === undefined) {
       await ctx.db.patch(invitation._id, { revokedAt: Date.now() });
-    }  },
+    }
+  },
 });
 
 
@@ -431,7 +554,8 @@ export const activeInvitationCount = internalQuery({
     const adminId = await requireAdministrator(ctx);
     const now = Date.now();
     const invitations = await ctx.db.query("betaInvitations").withIndex("by_creator_time", (q) => q.eq("createdBy", adminId)).collect();
-    return invitations.filter((invitation) => invitation.revokedAt === undefined && invitation.usedAt === undefined && invitation.expiresAt > now).length;  },
+    return invitations.filter((invitation) => invitation.revokedAt === undefined && invitation.usedAt === undefined && invitation.expiresAt > now).length;
+  },
 });
 
 
@@ -447,7 +571,7 @@ export const assertApprovedUser = internalQuery({
 });
 
 export const storeInvitation = internalMutation({
-  args: { codeHash: v.string(), recipientEmail: v.string(), expiresAt: v.number(), adminId: v.id("users"), label: v.string() },
+  args: { codeHash: v.string(), recipientEmail: v.optional(v.string()), expiresAt: v.number(), adminId: v.id("users"), label: v.string() },
   handler: async (ctx, args) => {
     const currentAdminId = await requireAdministrator(ctx);
     if (currentAdminId !== args.adminId) throw new ConvexError("Administrator identity changed; retry invitation creation.");
@@ -457,9 +581,10 @@ export const storeInvitation = internalMutation({
     const activeCount = invitations.filter((invitation) => invitation.revokedAt === undefined && invitation.usedAt === undefined && invitation.expiresAt > now).length;
     if (activeCount >= 10) throw new ConvexError("Revoke or wait for an existing invitation before creating another.");
     if (args.expiresAt <= now || args.expiresAt > now + MAX_INVITATION_LIFETIME_MS) throw new ConvexError("Invitation expiry must be within the allowed lifetime.");
-    if (!/^[a-f0-9]{64}$/.test(args.codeHash) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.recipientEmail)) throw new ConvexError("Invalid invitation data.");
+    if (!/^[a-f0-9]{64}$/.test(args.codeHash) || (args.recipientEmail !== undefined && normalizeEmailAddress(args.recipientEmail) !== args.recipientEmail)) throw new ConvexError("Invalid invitation data.");
     if (!/^••••[A-F0-9]{4}$/.test(args.label)) throw new ConvexError("Invalid invitation data.");
-    await ctx.db.insert("betaInvitations", { codeHash: args.codeHash, codeLabel: args.label, recipientEmail: args.recipientEmail, createdBy, createdAt: now, expiresAt: args.expiresAt });  },
+    await ctx.db.insert("betaInvitations", { codeHash: args.codeHash, codeLabel: args.label, ...(args.recipientEmail ? { recipientEmail: args.recipientEmail } : {}), createdBy, createdAt: now, expiresAt: args.expiresAt });
+  },
 });
 
 
@@ -483,8 +608,8 @@ export const _grantInitialAdministrator = mutation({
     await ctx.db.patch(userId, { role: "admin" });
     const access = await accessFor(ctx, userId);
     const now = Date.now();
-    if (access) await ctx.db.patch(access._id, { status: "approved", updatedAt: now, approvedAt: now, invitationId: undefined, invitationCodeLabel: undefined });
-    else await ctx.db.insert("betaAccess", { userId, status: "approved", requestedAt: now, updatedAt: now, approvedAt: now });
+    if (access) await ctx.db.patch(access._id, { userId, email: user.email.trim().toLowerCase(), status: "approved", updatedAt: now, approvedAt: now, invitationId: undefined, invitationCodeLabel: undefined });
+    else await ctx.db.insert("betaAccess", { userId, email: user.email.trim().toLowerCase(), status: "approved", requestedAt: now, updatedAt: now, approvedAt: now });
     return { administrator: true };
   },
 });

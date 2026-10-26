@@ -2,7 +2,7 @@ import { api } from "@/convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
 import { useMutation, useQuery } from "convex/react";
 import { useState, type FormEvent, type ReactNode } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -18,7 +18,9 @@ export function BetaGate({ children }: { children: ReactNode }) {
   const claimInitialAdministrator = useMutation(api.access._grantInitialAdministrator);
   const completeOnboarding = useMutation(api.users.completeOnboarding);
   const navigate = useNavigate();
+  const { pathname } = useLocation();
   const [code, setCode] = useState("");
+  const [requesterName, setRequesterName] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -53,9 +55,12 @@ export function BetaGate({ children }: { children: ReactNode }) {
   if (isLoading || (isAuthenticated && status === undefined)) {
     return <main className="flex min-h-screen items-center justify-center bg-background"><Loader2 className="size-6 animate-spin text-muted-foreground" /></main>;
   }
-  const gateView = resolveBetaGateView(isAuthenticated, status, user?.onboardingCompletedAt);
+  const gateView = resolveBetaGateView(isAuthenticated, status, pathname);
   if (gateView === "content") return children;
   if (gateView === "approval" && !status) return children;
+  if (gateView === "administrator-bootstrap") {
+    return <main className="flex min-h-screen items-center justify-center bg-background p-6"><Card className="w-full max-w-md"><CardHeader className="text-center"><ShieldCheck className="mx-auto size-8 text-primary" /><CardTitle>Configure your existing account</CardTitle><CardDescription>Your verified email matches the administrator configured for this deployment. This one-time step preserves your existing account and reward data.</CardDescription></CardHeader><CardContent><Button className="w-full" disabled={busy} onClick={() => { setBusy(true); void claimInitialAdministrator({}).then(() => toast.success("Administrator account configured.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not configure administrator access.")).finally(() => setBusy(false)); }}>Configure administrator</Button><Button variant="ghost" className="mt-2 w-full" disabled={busy} onClick={() => { setBusy(true); void signOut().finally(() => setBusy(false)); }}>Sign out</Button></CardContent></Card></main>;
+  }
   if (gateView === "onboarding") {
     if (!user) return <main className="flex min-h-screen items-center justify-center bg-background"><Loader2 className="size-6 animate-spin text-muted-foreground" /></main>;
     return <main className="flex min-h-screen items-center justify-center bg-background p-6">
@@ -65,18 +70,14 @@ export function BetaGate({ children }: { children: ReactNode }) {
       </Card>
     </main>;
   }
-  if (status?.canClaimInitialAdministrator && !status.administrator) {
-    return <main className="flex min-h-screen items-center justify-center bg-background p-6"><Card className="w-full max-w-md"><CardHeader className="text-center"><ShieldCheck className="mx-auto size-8 text-primary" /><CardTitle>Configure your existing account</CardTitle><CardDescription>Your verified email matches the administrator configured for this deployment. This one-time step preserves your existing account and reward data.</CardDescription></CardHeader><CardContent><Button className="w-full" disabled={busy} onClick={() => { setBusy(true); void claimInitialAdministrator({}).then(() => toast.success("Administrator account configured.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not configure administrator access.")).finally(() => setBusy(false)); }}>Configure administrator</Button><Button variant="ghost" className="mt-2 w-full" disabled={busy} onClick={() => { setBusy(true); void signOut().finally(() => setBusy(false)); }}>Sign out</Button></CardContent></Card></main>;
-  }
-
   if (!status) return children;
   return <main className="flex min-h-screen items-center justify-center bg-background p-6">
     <Card className="w-full max-w-md border-white/10 bg-card/90">
       <CardHeader className="text-center"><div className="mx-auto mb-2 flex size-12 items-center justify-center rounded-full bg-muted"><LockKeyhole className="size-5 text-muted-foreground" /></div><CardTitle>{status.status === "revoked" ? "Access revoked" : "Private beta approval"}</CardTitle><CardDescription>{status.status === "revoked" ? "Your Focus Rewards beta access has been revoked. Contact the administrator if you think this is a mistake." : "Your account is signed in, but protected Focus Rewards data is unavailable until access is approved."}</CardDescription></CardHeader>
       {status.status !== "revoked" && <CardContent className="space-y-4">
-        <form onSubmit={(event) => void submitInvitation(event)} className="space-y-3"><label htmlFor="beta-invitation" className="text-sm font-medium">Have an invitation for this email?</label><Input id="beta-invitation" autoComplete="off" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Paste your private invitation code" minLength={32} maxLength={64} required /><Button className="w-full" disabled={busy || code.trim().length < 32}>{busy ? "Checking invitation…" : "Claim invitation"}</Button></form>
-        <div className="text-center text-sm text-muted-foreground">or</div>
-        <Button variant="outline" className="w-full" disabled={busy} onClick={() => { setBusy(true); void requestApproval({}).then(() => toast.success("Approval request recorded. An administrator can review it under User Access.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not request approval.")).finally(() => setBusy(false)); }}>Request manual approval</Button>
+        <form onSubmit={(event) => void submitInvitation(event)} className="space-y-3"><label htmlFor="beta-invitation" className="text-sm font-medium">Have an invitation code?</label><Input id="beta-invitation" autoComplete="off" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Paste your private invitation code" minLength={32} maxLength={64} required /><Button className="w-full" disabled={busy || code.trim().length < 32}>{busy ? "Checking invitation…" : "Continue with code"}</Button></form>
+        <div className="text-center text-sm text-muted-foreground">or request approval</div>
+        <form className="flex items-center gap-2" onSubmit={(event) => { event.preventDefault(); setBusy(true); void requestApproval({ requesterName }).then(() => toast.success("Approval request recorded. An administrator can review your name under User Access.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not request approval.")).finally(() => setBusy(false)); }}><label className="sr-only" htmlFor="approval-requester-name">Your name for the approval request</label><Input id="approval-requester-name" autoComplete="nickname" maxLength={40} required value={requesterName} onChange={(event) => setRequesterName(event.target.value)} placeholder="Your name" disabled={busy} /><Button type="submit" variant="outline" className="shrink-0" disabled={busy || !requesterName.trim()}>{busy ? "Sending…" : "Request approval"}</Button></form>
       </CardContent>}
       <CardContent className="space-y-3"><p className="text-center text-xs text-muted-foreground">Access is checked on the server and bound to your signed-in account.</p><Button variant="ghost" className="w-full" disabled={busy} onClick={() => { setBusy(true); void signOut().finally(() => setBusy(false)); }}>Sign out or switch account</Button></CardContent>
     </Card>

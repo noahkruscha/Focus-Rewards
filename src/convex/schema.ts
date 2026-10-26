@@ -104,19 +104,23 @@ const schema = defineSchema(
     }).index("by_user", ["userId"]).index("by_user_reward", ["userId", "rewardId"]).index("by_user_idempotency", ["userId", "idempotencyKey"]).index("by_user_content", ["userId", "contentType", "contentId"]),
 
     betaAccess: defineTable({
-      userId: v.id("users"),
+      // userId-backed records are the per-account source of truth. Email-only
+      // records hold admin pre-approvals/revocations until an email account exists.
+      userId: v.optional(v.id("users")),
+      email: v.optional(v.string()),
       status: v.union(v.literal("pending"), v.literal("approved"), v.literal("revoked")),
       requestedAt: v.number(),
       updatedAt: v.number(),
       approvedAt: v.optional(v.number()),
       updatedBy: v.optional(v.id("users")),
+      requesterName: v.optional(v.string()),
       invitationId: v.optional(v.id("betaInvitations")),
       invitationCodeLabel: v.optional(v.string()),
-    }).index("by_user", ["userId"]).index("by_status", ["status"]),
+    }).index("by_user", ["userId"]).index("by_email", ["email"]).index("by_status", ["status"]),
 
     betaInvitations: defineTable({
       codeHash: v.string(),
-      recipientEmail: v.string(),
+      recipientEmail: v.optional(v.string()),
       createdBy: v.id("users"),
       createdAt: v.number(),
       expiresAt: v.number(),
