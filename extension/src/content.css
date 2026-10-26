@@ -1,3 +1,30 @@
+.fr-youtube-purchase {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(100%, 640px);
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(225, 190, 110, 0.24);
+  border-radius: 10px;
+  background: rgba(20, 22, 25, 0.94);
+  color: #eee;
+  font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.fr-youtube-purchase strong { color: #e4c780; }
+.fr-youtube-purchase button {
+  padding: 7px 10px;
+  border: 1px solid rgba(225, 190, 110, 0.3);
+  border-radius: 7px;
+  background: rgba(225, 190, 110, 0.11);
+  color: #f2dfb2;
+  font: inherit;
+  cursor: pointer;
+}
+.fr-youtube-purchase button:disabled { cursor: wait; opacity: 0.6; }
+.fr-youtube-message { color: #a9b1b3; }
+
 .fr-youtube-price {
   display: inline-flex !important;
   flex: 0 0 auto !important;

@@ -1,11 +1,42 @@
-import { requireApprovedUser } from "./access";
+import { requireAdministrator, requireApprovedUser } from "./access";
 import { ConvexError, v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
+import { internal } from "./_generated/api";
 
 const TASK_REWARD_MAX = 1000;
 const MAX_SESSION_MINUTES = 180;
+const YOUTUBE_ENTITLEMENT_DAYS = 30;
+const YOUTUBE_MAX_DURATION_SECONDS = 6 * 60 * 60;
+const DEFAULT_YOUTUBE_UNLOCK_PRICE_COINS = 36;
+const MAX_YOUTUBE_UNLOCK_PRICE_COINS = 10_000;
+
+function youtubeUnlockPrice() {
+  const configured = process.env.YOUTUBE_UNLOCK_PRICE_COINS;
+  if (configured === undefined || configured.trim() === "") return DEFAULT_YOUTUBE_UNLOCK_PRICE_COINS;
+  const price = Number(configured);
+  if (!Number.isSafeInteger(price) || price < 1 || price > MAX_YOUTUBE_UNLOCK_PRICE_COINS) {
+    throw new ConvexError("YouTube unlock price is misconfigured.");
+  }
+  return price;
+}
+
+function hasCompletedProfile(user: { displayName?: string; name?: string }) {
+  const name = user.displayName ?? user.name;
+  return Boolean(name && name.trim() && name.trim().length <= 40 && Array.from(name).every((character) => {
+    const point = character.codePointAt(0) ?? 0;
+    return point > 31 && (point < 127 || point > 159);
+  }));
+}
+
+function validateYouTubePurchaseDetails(videoId: string, contentType: string, durationSeconds: number) {
+  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId) || !["youtube_video", "youtube_short"].includes(contentType)
+    || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0 || durationSeconds > YOUTUBE_MAX_DURATION_SECONDS) {
+    throw new ConvexError("Invalid YouTube purchase request.");
+  }
+  // Duration is validated and recorded as client-reported metadata only; it never affects the server price.
+}
 const LEGACY_TRANSACTION_TYPES = {
   focus: "legacy_focus_reward",
   task: "legacy_task_reward",
@@ -26,7 +57,7 @@ async function requireAccount(ctx: QueryCtx | MutationCtx, userId: Id<"users">) 
   return account;
 }
 
-async function recordTransaction(ctx: MutationCtx, args: {
+export async function recordTransaction(ctx: MutationCtx, args: {
   userId: Id<"users">; amount: number; type: Doc<"walletTransactions">["type"];
   description: string; referenceType?: string; referenceId?: string; idempotencyKey: string; createdAt?: number;
 }) {
@@ -199,6 +230,123 @@ export const finishSession = mutation({
   },
 });
 
+export async function purchaseYouTubeEntitlement(ctx: MutationCtx, args: {
+  userId: Id<"users">;
+  videoId: string;
+  contentType: "youtube_video" | "youtube_short";
+  durationSeconds: number;
+  idempotencyKey: string;
+  now?: number;
+}) {
+  const { userId, videoId, contentType, durationSeconds, idempotencyKey } = args;
+  validateYouTubePurchaseDetails(videoId, contentType, durationSeconds);
+  if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(idempotencyKey)) {
+    throw new ConvexError("Invalid YouTube purchase request.");
+  }
+  const existingRequest = await ctx.db.query("libraryPurchases")
+    .withIndex("by_user_idempotency", (q) => q.eq("userId", userId).eq("idempotencyKey", `youtube:${idempotencyKey}`)).unique();
+  if (existingRequest) {
+    if (existingRequest.contentType !== contentType || existingRequest.contentId !== videoId || existingRequest.durationSeconds !== durationSeconds) {
+      throw new ConvexError("Idempotency key was already used for a different YouTube purchase.");
+    }
+    const previousExpiresAt = existingRequest.expiresAt ?? existingRequest.purchasedAt + YOUTUBE_ENTITLEMENT_DAYS * 86400000;
+    if (existingRequest.revokedAt !== undefined || previousExpiresAt <= (args.now ?? Date.now())) {
+      throw new ConvexError("This YouTube entitlement is expired or revoked.");
+    }
+    return { success: true as const, alreadyOwned: false, alreadyProcessed: true, price: existingRequest.cost, expiresAt: previousExpiresAt };
+  }
+
+  // Duration is validated and recorded as metadata; it never changes the deployment-configured server price.
+  const price = youtubeUnlockPrice();
+  const now = args.now ?? Date.now();
+  const matchingEntitlements = await ctx.db.query("libraryPurchases")
+    .withIndex("by_user_content", (q) => q.eq("userId", userId).eq("contentType", contentType).eq("contentId", videoId))
+    .order("desc")
+    .collect();
+  const validEntitlement = matchingEntitlements.find((purchase) => purchase.revokedAt === undefined
+    && (purchase.expiresAt ?? purchase.purchasedAt + (purchase.entitlementDays ?? YOUTUBE_ENTITLEMENT_DAYS) * 86400000) > now);
+  if (validEntitlement) {
+    const expiresAt = validEntitlement.expiresAt ?? validEntitlement.purchasedAt + (validEntitlement.entitlementDays ?? YOUTUBE_ENTITLEMENT_DAYS) * 86400000;
+    return { success: true as const, alreadyOwned: true, alreadyProcessed: false, price: validEntitlement.cost, expiresAt };
+  }
+
+  const account = await requireAccount(ctx, userId);
+  if (account.coins < price) throw new ConvexError("INSUFFICIENT_COINS");
+  const expiresAt = now + YOUTUBE_ENTITLEMENT_DAYS * 86400000;
+  const purchaseIdempotencyKey = `youtube:${idempotencyKey}`;
+  const transactionRecorded = await recordTransaction(ctx, {
+    userId,
+    amount: -price,
+    type: "youtube_purchase",
+    description: `YouTube ${contentType === "youtube_short" ? "Short" : "video"} access · ${videoId}`,
+    referenceType: "youtube_entitlement",
+    referenceId: videoId,
+    idempotencyKey: purchaseIdempotencyKey,
+    createdAt: now,
+  });
+  if (!transactionRecorded) {
+    const previousTransaction = await ctx.db.query("walletTransactions")
+      .withIndex("by_user_idempotency", (q) => q.eq("userId", userId).eq("idempotencyKey", purchaseIdempotencyKey)).unique();
+    if (!previousTransaction) throw new ConvexError("Could not confirm wallet transaction.");
+  }
+  const transaction = await ctx.db.query("walletTransactions")
+    .withIndex("by_user_idempotency", (q) => q.eq("userId", userId).eq("idempotencyKey", purchaseIdempotencyKey)).unique();
+  if (!transaction) throw new ConvexError("Could not confirm wallet transaction.");
+  await ctx.db.insert("libraryPurchases", {
+    userId,
+    rewardId: `youtube:${contentType}:${videoId}:${durationSeconds}`,
+    contentType,
+    contentId: videoId,
+    durationSeconds,
+    entitlementDays: YOUTUBE_ENTITLEMENT_DAYS,
+    transactionId: transaction._id,
+    cost: price,
+    purchasedAt: now,
+    expiresAt,
+    idempotencyKey: purchaseIdempotencyKey,
+  });
+  return { success: true as const, alreadyOwned: false, alreadyProcessed: false, price, expiresAt };
+}
+
+export const youtubePurchaseQuote = internalQuery({
+  args: { tokenHash: v.string(), videoId: v.string(), contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")), durationSeconds: v.number(), now: v.number() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();
+    if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) throw new ConvexError("Extension session is expired or revoked.");
+    const user = await ctx.db.get(session.userId);
+    if (!user || user.isAnonymous || !hasCompletedProfile(user)) throw new ConvexError("Extension session is expired or revoked.");
+    if (process.env.BETA_REQUIRE_APPROVAL !== "false") {
+      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+      if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
+    }
+    validateYouTubePurchaseDetails(args.videoId, args.contentType, args.durationSeconds);
+    return { price: youtubeUnlockPrice(), entitlementDays: YOUTUBE_ENTITLEMENT_DAYS };
+  },
+});
+
+export const verifyYouTubeEntitlement = internalQuery({
+  args: { tokenHash: v.string(), videoId: v.string(), contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")), now: v.number() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();
+    if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) return null;
+    const user = await ctx.db.get(session.userId);
+    if (!user || user.isAnonymous || !hasCompletedProfile(user)) return null;
+    const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+    if (process.env.BETA_REQUIRE_APPROVAL !== "false" && access?.status !== "approved") return null;
+    const entitlements = await ctx.db.query("libraryPurchases")
+      .withIndex("by_user_content", (q) => q.eq("userId", session.userId).eq("contentType", args.contentType).eq("contentId", args.videoId))
+      .order("desc")
+      .collect();
+    const entitlement = entitlements.find((purchase) => {
+      const expiresAt = purchase.expiresAt ?? purchase.purchasedAt + (purchase.entitlementDays ?? YOUTUBE_ENTITLEMENT_DAYS) * 86400000;
+      return purchase.revokedAt === undefined && expiresAt > args.now;
+    });
+    if (!entitlement) return null;
+    const expiresAt = entitlement.expiresAt ?? entitlement.purchasedAt + (entitlement.entitlementDays ?? YOUTUBE_ENTITLEMENT_DAYS) * 86400000;
+    return { expiresAt, durationSeconds: entitlement.durationSeconds ?? null };
+  },
+});
+
 export const purchaseReward = mutation({
   args: { rewardId: v.string(), cost: v.number(), idempotencyKey: v.string() },
   handler: async (ctx, args) => {
@@ -218,6 +366,26 @@ export const purchaseReward = mutation({
   },
 });
 
+export const purchaseYouTubeReward = internalMutation({
+  args: {
+    tokenHash: v.string(), videoId: v.string(),
+    contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")),
+    durationSeconds: v.number(), idempotencyKey: v.string(), now: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();
+    if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) throw new ConvexError("Extension session is expired or revoked.");
+    const user = await ctx.db.get(session.userId);
+    if (!user || user.isAnonymous) throw new ConvexError("Extension session is expired or revoked.");
+    if (process.env.BETA_REQUIRE_APPROVAL !== "false") {
+      const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", session.userId)).unique();
+      if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
+    }
+    if (!hasCompletedProfile(user)) throw new ConvexError("Complete your profile setup to continue.");
+    return await purchaseYouTubeEntitlement(ctx, { ...args, userId: session.userId });
+  },
+});
+
 export const previewLegacyMigration = query({
   args: { migrationKey: v.string() },
   handler: async (ctx, args) => {
@@ -228,16 +396,22 @@ export const previewLegacyMigration = query({
   },
 });
 
-export const importLegacyData = mutation({
-  args: {
-    migrationKey: v.string(), confirmed: v.boolean(), snapshotHash: v.string(), oldBalance: v.number(), dailyCap: v.number(), taskBonus: v.number(), reconcileCoins: v.number(),
-    tasks: v.array(v.object({ id: v.string(), title: v.string(), completed: v.boolean(), completedAt: v.union(v.number(), v.null()), rewardCoins: v.number(), bonusAwarded: v.boolean() })),
-    sessions: v.array(v.object({ id: v.string(), activity: v.string(), minutes: v.number(), coins: v.number(), finishedAt: v.number() })),
-    taskRewards: v.array(v.object({ taskId: v.string(), title: v.string(), coins: v.number(), awardedAt: v.number() })),
-    videoUnlocks: v.array(v.object({ videoId: v.string(), unlockedAt: v.number(), cost: v.number() })),
-  },
-  handler: async (ctx, args) => {
-    const userId = await authenticatedUserId(ctx);
+type LegacyImportResult =
+  | { alreadyMigrated: true }
+  | { alreadyMigrated: false; importedTasks: number; importedSessions: number; importedPurchases: number; reconciledCoins: number; eventNet: number };
+
+const legacyImportArgs = {
+  migrationKey: v.string(), confirmed: v.boolean(), snapshotHash: v.string(), oldBalance: v.number(), dailyCap: v.number(), taskBonus: v.number(), reconcileCoins: v.number(),
+  tasks: v.array(v.object({ id: v.string(), title: v.string(), completed: v.boolean(), completedAt: v.union(v.number(), v.null()), rewardCoins: v.number(), bonusAwarded: v.boolean() })),
+  sessions: v.array(v.object({ id: v.string(), activity: v.string(), minutes: v.number(), coins: v.number(), finishedAt: v.number() })),
+  taskRewards: v.array(v.object({ taskId: v.string(), title: v.string(), coins: v.number(), awardedAt: v.number() })),
+  videoUnlocks: v.array(v.object({ videoId: v.string(), unlockedAt: v.number(), cost: v.number() })),
+};
+
+export const importLegacyDataInternal = internalMutation({
+  args: legacyImportArgs,
+  handler: async (ctx, args): Promise<LegacyImportResult> => {
+    const userId = await requireAdministrator(ctx);
     if (args.migrationKey !== "momentum-v1" || !args.confirmed || !args.snapshotHash || !Number.isSafeInteger(args.oldBalance) || args.oldBalance < 0) throw new ConvexError("Migration requires a reviewed, valid legacy snapshot.");
     if (!Number.isInteger(args.dailyCap) || args.dailyCap < 1 || args.dailyCap > 500 || !Number.isInteger(args.taskBonus) || args.taskBonus < 0 || args.taskBonus > 100) throw new ConvexError("Invalid legacy settings.");
     if (args.tasks.length > 1000 || args.sessions.length > 5000 || args.taskRewards.length > 5000 || args.videoUnlocks.length > 1000) throw new ConvexError("Legacy snapshot exceeds import limits.");
@@ -262,7 +436,6 @@ export const importLegacyData = mutation({
     const taskIds = new Map<string, Id<"tasks">>();
     const derivedTaskRewards = args.taskRewards.length ? args.taskRewards : args.tasks.filter((task) => task.completed && task.bonusAwarded).map((task) => ({ taskId: task.id, title: task.title, coins: task.rewardCoins, awardedAt: task.completedAt ?? 0 }));
     for (const task of args.tasks) {
-      if (!task.id.trim() || !task.title.trim() || task.title.length > 100 || !Number.isSafeInteger(task.rewardCoins) || task.rewardCoins < 0 || task.rewardCoins > TASK_REWARD_MAX || (task.completed && (!Number.isSafeInteger(task.completedAt) || task.completedAt! < 0))) throw new ConvexError("Legacy task data needs review before import.");
       if (!task.id.trim() || !task.title.trim() || task.title.length > 100 || !Number.isSafeInteger(task.rewardCoins) || task.rewardCoins < 0 || task.rewardCoins > TASK_REWARD_MAX || (task.completed && task.completedAt !== null && (!Number.isSafeInteger(task.completedAt) || task.completedAt < 0))) throw new ConvexError("Legacy task data needs review before import.");
       const id = await ctx.db.insert("tasks", { userId, legacyId: `legacy:${args.snapshotHash}:task:${task.id}`, title: task.title, completed: task.completed, completedAt: task.completedAt, rewardCoins: task.rewardCoins, rewardAwarded: task.completed && task.bonusAwarded });
       taskIds.set(task.id, id);
@@ -294,7 +467,26 @@ export const importLegacyData = mutation({
     if (reconcileCoins < 0) throw new ConvexError("Legacy history exceeds the saved balance; manual review is required and no migration was committed.");
     if (reconcileCoins > 0) await recordTransaction(ctx, { userId, amount: reconcileCoins, type: "legacy_reconciliation", description: "Opening balance reconciliation from verified legacy wallet", referenceType: "migration", referenceId: args.snapshotHash, idempotencyKey: `legacy:${args.snapshotHash}:reconciliation` });
     const updatedAccount = await requireAccount(ctx, userId);
-    await ctx.db.patch(updatedAccount._id, { coins: args.oldBalance, dailyCap: args.dailyCap, taskBonus: args.taskBonus, migrationCompletedAt: Date.now(), migrationReport: { importedTasks: args.tasks.length, importedSessions: args.sessions.length, importedPurchases: args.videoUnlocks.length, reconciledCoins: reconcileCoins, oldBalance: args.oldBalance, eventNet } });
+    if (updatedAccount.coins !== args.oldBalance) {
+      await recordTransaction(ctx, {
+        userId,
+        amount: args.oldBalance - updatedAccount.coins,
+        type: "legacy_reconciliation",
+        description: "Legacy balance reconciliation",
+        referenceType: "migration",
+        referenceId: args.snapshotHash,
+        idempotencyKey: `legacy:${args.snapshotHash}:balance-correction`,
+      });
+    }
+    await ctx.db.patch(updatedAccount._id, { dailyCap: args.dailyCap, taskBonus: args.taskBonus, migrationCompletedAt: Date.now(), migrationReport: { importedTasks: args.tasks.length, importedSessions: args.sessions.length, importedPurchases: args.videoUnlocks.length, reconciledCoins: reconcileCoins, oldBalance: args.oldBalance, eventNet } });
     return { alreadyMigrated: false, importedTasks: args.tasks.length, importedSessions: args.sessions.length, importedPurchases: args.videoUnlocks.length, reconciledCoins: reconcileCoins, eventNet };
+  },
+});
+
+export const importLegacyData = action({
+  args: legacyImportArgs,
+  handler: async (ctx, args): Promise<LegacyImportResult> => {
+    await ctx.runQuery(internal.access.assertAdministrator, {});
+    return await ctx.runMutation(internal.rewards.importLegacyDataInternal, args);
   },
 });

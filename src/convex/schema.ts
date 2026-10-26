@@ -23,7 +23,9 @@ const schema = defineSchema(
 
     // the users table is the default users table that is brought in by the authTables
     users: defineTable({
-      name: v.optional(v.string()), // name of the user. do not remove
+      name: v.optional(v.string()), // auth-provided name; legacy field retained
+      displayName: v.optional(v.string()), // onboarding name, independent from auth identity
+      onboardingCompletedAt: v.optional(v.number()),
       image: v.optional(v.string()), // image of the user. do not remove
       email: v.optional(v.string()), // email of the user. do not remove
       emailVerificationTime: v.optional(v.number()), // email verification time. do not remove
@@ -77,7 +79,7 @@ const schema = defineSchema(
       type: v.union(
         v.literal("focus_reward"), v.literal("task_reward"), v.literal("library_purchase"),
         v.literal("legacy_focus_reward"), v.literal("legacy_task_reward"),
-        v.literal("legacy_library_purchase"), v.literal("legacy_reconciliation"),
+        v.literal("legacy_library_purchase"), v.literal("legacy_reconciliation"), v.literal("youtube_purchase"),
       ),
       description: v.string(),
       referenceType: v.optional(v.string()),
@@ -92,14 +94,24 @@ const schema = defineSchema(
       cost: v.number(),
       purchasedAt: v.number(),
       idempotencyKey: v.string(),
-    }).index("by_user", ["userId"]).index("by_user_reward", ["userId", "rewardId"]).index("by_user_idempotency", ["userId", "idempotencyKey"]),
+      contentType: v.optional(v.union(v.literal("youtube_video"), v.literal("youtube_short"))),
+      contentId: v.optional(v.string()),
+      durationSeconds: v.optional(v.number()),
+      entitlementDays: v.optional(v.number()),
+      transactionId: v.optional(v.id("walletTransactions")),
+      expiresAt: v.optional(v.number()),
+      revokedAt: v.optional(v.number()),
+    }).index("by_user", ["userId"]).index("by_user_reward", ["userId", "rewardId"]).index("by_user_idempotency", ["userId", "idempotencyKey"]).index("by_user_content", ["userId", "contentType", "contentId"]),
 
     betaAccess: defineTable({
       userId: v.id("users"),
       status: v.union(v.literal("pending"), v.literal("approved"), v.literal("revoked")),
       requestedAt: v.number(),
       updatedAt: v.number(),
+      approvedAt: v.optional(v.number()),
       updatedBy: v.optional(v.id("users")),
+      invitationId: v.optional(v.id("betaInvitations")),
+      invitationCodeLabel: v.optional(v.string()),
     }).index("by_user", ["userId"]).index("by_status", ["status"]),
 
     betaInvitations: defineTable({
@@ -111,7 +123,25 @@ const schema = defineSchema(
       revokedAt: v.optional(v.number()),
       usedAt: v.optional(v.number()),
       claimedBy: v.optional(v.id("users")),
-    }).index("by_hash", ["codeHash"]).index("by_creator_time", ["createdBy", "createdAt"]),
+      codeLabel: v.optional(v.string()),
+    }).index("by_hash", ["codeHash"]).index("by_creator_time", ["createdBy", "createdAt"]).index("by_expiry", ["expiresAt"]),
+
+    extensionPairingCodes: defineTable({
+      codeHash: v.string(),
+      userId: v.id("users"),
+      createdAt: v.number(),
+      expiresAt: v.number(),
+      usedAt: v.optional(v.number()),
+      revokedAt: v.optional(v.number()),
+    }).index("by_hash", ["codeHash"]).index("by_user", ["userId"]),
+
+    extensionSessions: defineTable({
+      tokenHash: v.string(),
+      userId: v.id("users"),
+      createdAt: v.number(),
+      expiresAt: v.number(),
+      revokedAt: v.optional(v.number()),
+    }).index("by_hash", ["tokenHash"]).index("by_user", ["userId"]),
   },
   {
     schemaValidation: false,

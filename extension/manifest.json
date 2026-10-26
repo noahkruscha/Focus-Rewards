@@ -4,7 +4,16 @@
   "version": "1.0.0",
   "description": "See an estimated Focus Rewards coin value on regular YouTube video recommendations.",
   "permissions": ["storage"],
-  "host_permissions": ["https://www.youtube.com/*"],
+  "web_accessible_resources": [
+    {
+      "resources": ["options/options.html"],
+      "matches": ["https://www.youtube.com/*"]
+    }
+  ],
+  "host_permissions": ["https://www.youtube.com/*", "https://*.convex.site/*"],
+  "background": {
+    "service_worker": "src/service-worker.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],

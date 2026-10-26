@@ -17,3 +17,13 @@ h1 { margin: 0; color: #f2f5f3; font-size: 27px; font-weight: 580; letter-spacin
 input[type="checkbox"] { width: 38px; height: 21px; flex: 0 0 auto; margin: 0; accent-color: #8ce7c6; cursor: pointer; }
 .status { min-height: 16px; margin: 12px 0 0; color: #91d7b7; font-size: 11px; }
 .note { margin: 20px 0 0; color: #6f7b7f; font-size: 10px; line-height: 1.6; }
+.account-settings { margin-top: 30px; padding-top: 24px; border-top: 1px solid rgba(255,255,255,.08); }
+.account-settings .eyebrow { margin-top: 0; }
+.account-settings h1 { font-size: 22px; }
+.account-settings form { display: grid; gap: 9px; }
+.account-settings form label { margin-top: 5px; color: #a8b2b0; font-size: 11px; }
+.account-settings input { width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; background: rgba(0,0,0,.2); color: #edf1ef; font: inherit; font-size: 12px; }
+.account-settings button { min-height: 38px; margin-top: 5px; padding: 8px 12px; border: 1px solid rgba(140,231,198,.2); border-radius: 8px; background: rgba(140,231,198,.1); color: #b8f2d8; cursor: pointer; font: inherit; font-size: 12px; }
+.account-status { min-height: 20px; margin-top: 12px; color: #91d7b7; font-size: 11px; line-height: 1.5; }
+.account-settings #revoke-button { border-color: rgba(242,122,122,.25); background: rgba(242,122,122,.08); color: #ffc0c0; }
+.account-settings #revoke-button[hidden] { display: none; }

@@ -1,7 +1,11 @@
 (function (root) {
   "use strict";
 
-  const COINS_PER_MINUTE = 1.2;
+  let COINS_PER_MINUTE = 1.2;
+
+  function setCoinsPerMinute(value) {
+    if (Number.isFinite(value) && value > 0 && value <= 100) COINS_PER_MINUTE = value;
+  }
 
   function priceForDurationSeconds(durationSeconds) {
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return null;
@@ -36,7 +40,8 @@
   }
 
   root.FocusRewardsPricing = Object.freeze({
-    COINS_PER_MINUTE,
+    get COINS_PER_MINUTE() { return COINS_PER_MINUTE; },
+    setCoinsPerMinute,
     parseDurationSeconds,
     priceForDurationSeconds,
   });

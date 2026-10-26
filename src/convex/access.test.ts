@@ -3,6 +3,7 @@ import type { TestConvex } from "convex-test";
 import { describe, expect, it } from "vitest";
 import schema from "./schema";
 import { api } from "./_generated/api";
+import { resolveBetaGateView } from "../components/betaGateView";
 import type { Doc } from "./_generated/dataModel";
 
 const modules = {
@@ -10,6 +11,7 @@ const modules = {
   "./_generated/server.js": () => import("./_generated/server.js"),
   "./access.ts": () => import("./access"),
   "./rewards.ts": () => import("./rewards"),
+  "./http.ts": () => import("./http"),
   "./users.ts": () => import("./users"),
 };
 const ADMIN_EMAIL = "owner@example.com";
@@ -21,25 +23,52 @@ function createTest() {
   return convexTest(schema, modules as never) as TestConvex<typeof schema>;
 }
 
-async function createUser(t: ReturnType<typeof createTest>, email: string) {
+async function createUser(t: ReturnType<typeof createTest>, email: string, displayName = "Beta member") {
   return await t.run(async (ctx) => await ctx.db.insert("users", {
     email,
+    displayName,
+    ...(displayName.trim() ? { onboardingCompletedAt: Date.now() } : {}),
     emailVerificationTime: Date.now(),
     isAnonymous: false,
   }));
 }
 
 async function makeAdmin(t: ReturnType<typeof createTest>) {
-  const adminId = await createUser(t, ADMIN_EMAIL);
+  const adminId = await t.run(async (ctx) => await ctx.db.insert("users", {
+    email: ADMIN_EMAIL,
+    displayName: "Owner",
+    onboardingCompletedAt: Date.now(),
+    emailVerificationTime: Date.now(),
+    isAnonymous: false,
+  }));
   const admin = t.withIdentity({ subject: `${adminId}|session-admin`, email: ADMIN_EMAIL });
   await admin.mutation(api.access._grantInitialAdministrator);
   return { adminId, admin };
 }
 
 describe("private beta access", () => {
+  it("shows onboarding to an approved account without a profile instead of the approval-waiting screen", () => {
+    expect(resolveBetaGateView(true, {
+      approvalRequired: true,
+      approved: true,
+      onboardingComplete: false,
+    })).toBe("onboarding");
+    expect(resolveBetaGateView(true, {
+      approvalRequired: true,
+      approved: false,
+      onboardingComplete: false,
+    })).toBe("approval");
+  });
+
   it("preserves the existing administrator account and existing reward data during bootstrap", async () => {
     const t = createTest();
-    const adminId = await createUser(t, ADMIN_EMAIL);
+    const adminId = await t.run(async (ctx) => await ctx.db.insert("users", {
+      email: ADMIN_EMAIL,
+      displayName: "Owner",
+      onboardingCompletedAt: Date.now(),
+      emailVerificationTime: Date.now(),
+      isAnonymous: false,
+    }));
     await t.run(async (ctx) => {
       await ctx.db.insert("accountData", { userId: adminId, coins: 47, dailyCap: 99, taskBonus: 8 });
       await ctx.db.insert("tasks", { userId: adminId, title: "Existing", completed: false, completedAt: null, rewardCoins: 3 });
@@ -87,7 +116,7 @@ describe("private beta access", () => {
     const t = createTest();
     const { admin } = await makeAdmin(t);
     const { code } = await admin.action(api.access.createInvitation, { recipientEmail: "Friend@Example.com" });
-    expect(code).toHaveLength(32);
+    expect(code).toHaveLength(48);
     const stored = await t.run(async (ctx) => await ctx.db.query("betaInvitations").collect());
     expect(stored).toHaveLength(1);
     expect(stored[0].codeHash).not.toBe(code);
@@ -105,6 +134,17 @@ describe("private beta access", () => {
     expect(invitations[0].claimedBy).toBe(friendId);
   });
 
+  it("validates without consuming and normalizes an invitation code and recipient email", async () => {
+    const t = createTest();
+    const { admin } = await makeAdmin(t);
+    const { code } = await admin.action(api.access.createInvitation, { recipientEmail: "Friend@Example.com" });
+    expect((await t.mutation(api.access.validateInvitation, { code: ` ${code.toLowerCase()} `, email: " friend@example.com " })).valid).toBe(true);
+    const invitations = await t.run(async (ctx) => await ctx.db.query("betaInvitations").collect());
+    expect(invitations[0].usedAt).toBeUndefined();
+    expect((await t.mutation(api.access.validateInvitation, { code, email: "wrong@example.com" })).valid).toBe(false);
+    expect((await t.mutation(api.access.validateInvitation, { code: "A".repeat(48), email: "friend@example.com" })).valid).toBe(false);
+  });
+
   it("rejects unauthenticated claims and invitation creation, while a normal user cannot mint invitations", async () => {
     const t = createTest();
     await expect(t.mutation(api.access.claimInvitation, { code: "A".repeat(32) })).rejects.toThrow(/Sign in/);
@@ -120,7 +160,7 @@ describe("private beta access", () => {
     const { admin } = await makeAdmin(t);
     const recipientId = await createUser(t, "friend@example.com");
     const friend = t.withIdentity({ subject: `${recipientId}|s`, email: "friend@example.com" });
-    const expiredCode = "A".repeat(32);
+    const expiredCode = "A".repeat(48);
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`focus-rewards-beta-invite:v1:${expiredCode}`));
     const expiredHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
     await t.run(async (ctx) => {
@@ -131,15 +171,24 @@ describe("private beta access", () => {
     const { code } = await admin.action(api.access.createInvitation, { recipientEmail: "friend@example.com" });
     const generatedHashDigest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`focus-rewards-beta-invite:v1:${code}`));
     const generatedHash = Array.from(new Uint8Array(generatedHashDigest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    const overview = await admin.query(api.access.adminOverview);
-    const invitation = overview.invitations.find((item: { id: string; recipientEmail: string; used: boolean; revoked: boolean }) => item.recipientEmail === "friend@example.com" && !item.used && !item.revoked && !overview.invitations.some((other: { id: string; used: boolean }) => other.id !== item.id && other.used));
-    expect(invitation).toBeDefined();
     const matchingInvitation = await t.run(async (ctx) => (await ctx.db.query("betaInvitations").collect()).find((item: Doc<"betaInvitations">) => item.codeHash === generatedHash));
     expect(matchingInvitation).toBeDefined();
     await admin.mutation(api.access.revokeInvitation, { invitationId: matchingInvitation!._id });
     const afterRevoke = await admin.query(api.access.adminOverview);
-    expect(afterRevoke.invitations.find((item: { id: string }) => item.id === matchingInvitation!._id)?.revoked).toBe(true);
+    expect(afterRevoke.invitations.find((item) => item.id === matchingInvitation!._id)?.status).toBe("revoked");
     await expect(friend.mutation(api.access.claimInvitation, { code })).rejects.toThrow(/invalid, expired, revoked, or already used/);
+  });
+
+  it("keeps manually approved users on the existing access workflow", async () => {
+    const t = createTest();
+    const { admin } = await makeAdmin(t);
+    const userId = await t.run(async (ctx) => await ctx.db.insert("users", { email: "manual@example.com", emailVerificationTime: Date.now(), isAnonymous: false }));
+    const manualUser = t.withIdentity({ subject: `${userId}|manual`, email: "manual@example.com" });
+    await manualUser.mutation(api.access.requestApproval);
+    await admin.mutation(api.access.approveUser, { userId });
+    await manualUser.mutation(api.users.completeOnboarding, { displayName: "Manual member" });
+    expect((await manualUser.query(api.users.currentUser))?._id).toBe(userId);
+    expect((await manualUser.query(api.rewards.snapshot)).initialized).toBe(false);
   });
 
   it("allows admin approvals, enforces per-user data isolation, ignores spoofed user IDs, and revokes immediately", async () => {
@@ -165,6 +214,24 @@ describe("private beta access", () => {
       expect(account).toBeDefined();
       expect((await ctx.db.query("tasks").collect()).filter((item: Doc<"tasks">) => item.userId === firstId)).toHaveLength(1);
     });
+  });
+
+  it("persists onboarding once, rejects unapproved users, and protects existing names", async () => {
+    const t = createTest();
+    const { admin } = await makeAdmin(t);
+    const friendId = await t.run(async (ctx) => await ctx.db.insert("users", { email: "friend@example.com", emailVerificationTime: Date.now(), isAnonymous: false }));
+    const friend = t.withIdentity({ subject: `${friendId}|friend`, email: "friend@example.com" });
+    await expect(friend.mutation(api.users.completeOnboarding, { displayName: "Friend" })).rejects.toThrow(/not been approved/);
+    await admin.mutation(api.access.approveUser, { userId: friendId });
+    expect((await friend.query(api.users.currentUser))?.onboardingCompletedAt).toBeUndefined();
+    await friend.mutation(api.users.completeOnboarding, { displayName: "  Friend  " });
+    const completed = await friend.query(api.users.currentUser);
+    expect(completed?.displayName).toBe("Friend");
+    expect(completed?.onboardingCompletedAt).toBeDefined();
+    await friend.mutation(api.users.completeOnboarding, { displayName: "Changed" });
+    expect((await friend.query(api.users.currentUser))?.displayName).toBe("Friend");
+    await expect(friend.mutation(api.users.completeOnboarding, { displayName: "\u0000" })).rejects.toThrow(/control characters/);
+    await expect(t.mutation(api.users.completeOnboarding, { displayName: "Name" })).rejects.toThrow(/Sign in/);
   });
 
   it("allows only one account to claim a single-use invitation", async () => {

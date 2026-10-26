@@ -15,8 +15,10 @@ import {
 } from "@/components/ui/input-otp";
 
 import { useAuth } from "@/hooks/use-auth";
-import { ArrowRight, Coins, Loader2, LockKeyhole, Mail, UserX, Zap } from "lucide-react";
-import { Suspense, useEffect, useState } from "react";
+import { api } from "@/convex/_generated/api";
+import { useMutation } from "convex/react";
+import { ArrowRight, Coins, Loader2, LockKeyhole, Mail, UserX, Zap, Ticket } from "lucide-react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 
@@ -36,6 +38,8 @@ function resolveRedirectAfterAuth(
 
 function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const { isLoading: authLoading, isAuthenticated, signIn } = useAuth();
+  const validateInvitation = useMutation(api.access.validateInvitation);
+  const claimInvitation = useMutation(api.access.claimInvitation);
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const redirect = resolveRedirectAfterAuth(
@@ -43,26 +47,52 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     redirectAfterAuth,
   );
   const [step, setStep] = useState<"signIn" | { email: string }>("signIn");
+  const [signupMode, setSignupMode] = useState(false);
+  const [invitationCode, setInvitationCode] = useState("");
+  const [pendingInvitationCode, setPendingInvitationCode] = useState<string | null>(null);
+  const invitationClaimRef = useRef<Promise<unknown> | null>(null);
   const [otp, setOtp] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!authLoading && isAuthenticated) {
+    if (!authLoading && isAuthenticated && !pendingInvitationCode) {
       navigate(redirect);
     }
-  }, [authLoading, isAuthenticated, navigate, redirect]);
+  }, [authLoading, isAuthenticated, navigate, pendingInvitationCode, redirect]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !pendingInvitationCode) return;
+    let cancelled = false;
+    invitationClaimRef.current ??= claimInvitation({ code: pendingInvitationCode });
+    void invitationClaimRef.current.then(() => {
+      if (!cancelled) navigate(redirect, { replace: true });
+    }).catch((claimError: unknown) => {
+      if (cancelled) return;
+      setError(claimError instanceof Error ? claimError.message : "The invitation could not be claimed.");
+      setPendingInvitationCode(null);
+      invitationClaimRef.current = null;
+      navigate(redirect, { replace: true });
+    });
+    return () => { cancelled = true; };
+  }, [claimInvitation, isAuthenticated, navigate, pendingInvitationCode, redirect]);
   const handleEmailSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setIsLoading(true);
     setError(null);
     try {
       const formData = new FormData(event.currentTarget);
+      const email = String(formData.get("email") ?? "").trim().toLowerCase();
+      if (signupMode) {
+        const result = await validateInvitation({ code: invitationCode, email });
+        if (!result.valid) throw new Error("That invitation is invalid, expired, revoked, used, or intended for another email.");
+        setPendingInvitationCode(invitationCode.trim());
+      }
       await signIn("email-otp", formData);
-      setStep({ email: formData.get("email") as string });
+      setStep({ email });
       setIsLoading(false);
     } catch (error) {
-      console.error("Email sign-in error:", error);
+      setPendingInvitationCode(null);
       setError(
         error instanceof Error
           ? error.message
@@ -79,12 +109,10 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     try {
       const formData = new FormData(event.currentTarget);
       await signIn("email-otp", formData);
-
-      navigate(redirect);
+      if (!pendingInvitationCode) navigate(redirect);
     } catch (error) {
-      console.error("OTP verification error:", error);
-
-      setError("The verification code you entered is incorrect.");
+      setPendingInvitationCode(null);
+      setError(error instanceof Error ? error.message : "The verification code you entered is incorrect.");
       setIsLoading(false);
 
       setOtp("");
@@ -120,10 +148,13 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                 <CardDescription>
                   Enter your email to sign in or create your personal space.
                 </CardDescription>
+                <Button type="button" variant="link" className="mt-2 h-auto" onClick={() => { setSignupMode((value) => !value); setError(null); }}>
+                  <Ticket className="mr-1 size-4" />{signupMode ? "Sign in without an invitation" : "Sign up with an invitation code"}
+                </Button>
               </CardHeader>
               <form onSubmit={handleEmailSubmit}>
                 <CardContent>
-                  
+                  {signupMode && <label className="mb-3 grid gap-1 text-sm font-medium" htmlFor="signup-invitation-code">Invitation code<Input id="signup-invitation-code" autoComplete="off" value={invitationCode} onChange={(event) => setInvitationCode(event.target.value)} placeholder="Paste your invitation code" minLength={32} maxLength={64} required disabled={isLoading} /></label>}
                   <div className="relative flex items-center gap-2">
                     <div className="relative flex-1">
                       <Mail className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
@@ -225,7 +256,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                     <Button
                       variant="link"
                       className="p-0 h-auto"
-                      onClick={() => setStep("signIn")}
+                      onClick={() => { setPendingInvitationCode(null); setStep("signIn"); }}
                     >
                       Try again
                     </Button>
@@ -252,7 +283,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                   <Button
                     type="button"
                     variant="ghost"
-                    onClick={() => setStep("signIn")}
+                    onClick={() => { setPendingInvitationCode(null); invitationClaimRef.current = null; setStep("signIn"); }}
                     disabled={isLoading}
                     className="w-full"
                   >

@@ -42,7 +42,7 @@ import {
 import { useAuth } from "@/hooks/use-auth";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
-import { useMutation, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { useNavigate } from "react-router";
 import { LEGACY_DATA_KEY, preserveLegacyBackup, previewLegacyMigration, type MigrationPreview } from "@/lib/legacyMigration";
 
@@ -162,6 +162,11 @@ function currentTimestamp() {
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const createExtensionPairingCode = useAction(api.access.createExtensionPairingCode);
+  const revokeExtensionSession = useMutation(api.access.revokeExtensionSession);
+  const extensionSessions = useQuery(api.access.extensionSessions, user ? {} : "skip");
+  const [pairingCode, setPairingCode] = useState<{ code: string; expiresAt: number } | null>(null);
+  const [pairingBusy, setPairingBusy] = useState(false);
   const snapshot = useQuery(api.rewards.snapshot, user ? {} : "skip");
   const initializeAccount = useMutation(api.rewards.initialize);
   const setRemoteSettings = useMutation(api.rewards.setSettings);
@@ -173,7 +178,7 @@ export default function Dashboard() {
   const updateRemoteSession = useMutation(api.rewards.updateActiveSession);
   const finishRemoteSession = useMutation(api.rewards.finishSession);
   const purchaseRemoteReward = useMutation(api.rewards.purchaseReward);
-  const importRemoteData = useMutation(api.rewards.importLegacyData);
+  const importRemoteData = useAction(api.rewards.importLegacyData);
   const [data, setData] = useState<MomentumData>(readData);
   const [migrationPreview, setMigrationPreview] = useState<MigrationPreview | null>(null);
   const [migrationError, setMigrationError] = useState<string | null>(null);
@@ -215,9 +220,9 @@ export default function Dashboard() {
     setWalletTransactions(snapshot.transactions);
   }, [snapshot]);
   useEffect(() => {
-    if (!user || !snapshot?.initialized || snapshot.migrationCompletedAt) return;
+    if (user?.role !== "admin" || !snapshot?.initialized || snapshot.migrationCompletedAt) return;
     void previewLegacyMigration(localStorage).then(setMigrationPreview).catch((error: unknown) => setMigrationError(error instanceof Error ? error.message : "Could not inspect saved local data."));
-  }, [user, snapshot?.initialized, snapshot?.migrationCompletedAt]);
+  }, [user?.role, snapshot?.initialized, snapshot?.migrationCompletedAt]);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
@@ -436,6 +441,18 @@ export default function Dashboard() {
     void deleteRemoteTask({ taskId }).then(() => toast("Task removed.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't delete task."));
   }
 
+  async function createPairingCode() {
+    setPairingBusy(true);
+    try {
+      setPairingCode(await createExtensionPairingCode({}));
+      toast.success("Pairing code created. Enter it in the Focus Rewards extension within five minutes.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not create an extension pairing code.");
+    } finally {
+      setPairingBusy(false);
+    }
+  }
+
   function unlockVideo(video: SampleVideo) {
     if (data.videoUnlocks.some((unlock) => unlock.videoId === video.id)) {
       setSelectedVideoId(video.id);
@@ -491,13 +508,13 @@ export default function Dashboard() {
         <header className="topbar">
           <div className="mobile-brand"><span className="brand-mark"><Zap size={15} fill="currentColor" /></span> Focus Rewards</div>
           <div className="topbar-date">{new Date(now).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
-          <div className="topbar-actions"><button className="topbar-account" title={`${user?.email ?? "Your account"} · Sign out`} onClick={() => void handleSignOut()}><span className="account-avatar">{user?.name?.slice(0, 1) ?? user?.email?.slice(0, 1) ?? "Y"}</span><span className="account-label">{user?.name ?? user?.email ?? "My space"}</span><LogOut size={13} /></button><div className="balance-pill" aria-label={`${data.coins} coin balance`}><span className="coin-glyph"><Coins size={15} /></span><strong>{data.coins}</strong><span>coins</span></div></div>
+          <div className="topbar-actions"><button className="topbar-account" title={`${user?.email ?? "Your account"} · Sign out`} onClick={() => void handleSignOut()}><span className="account-avatar">{(user?.displayName ?? user?.name)?.slice(0, 1) ?? user?.email?.slice(0, 1) ?? "Y"}</span><span className="account-label">{user?.displayName ?? user?.name ?? user?.email ?? "My space"}</span><LogOut size={13} /></button><div className="balance-pill" aria-label={`${data.coins} coin balance`}><span className="coin-glyph"><Coins size={15} /></span><strong>{data.coins}</strong><span>coins</span></div></div>
         </header>
 
         <div className="main-inner">
           {view === "today" ? (
             <motion.section key="today" className="page-content" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
-              <div className="page-heading"><div><span className="eyebrow">A FRESH START, EVERY DAY</span><h1>{new Date(now).getHours() < 12 ? "Good morning" : new Date(now).getHours() < 18 ? "Good afternoon" : "Good evening"}{user?.name ? `, ${user.name.split(" ")[0]}` : ""}.</h1><p>Make a little progress on what matters.</p></div><div className="heading-icon"><Sparkles size={19} /></div></div>
+              <div className="page-heading"><div><span className="eyebrow">A FRESH START, EVERY DAY</span><h1>{new Date(now).getHours() < 12 ? "Good morning" : new Date(now).getHours() < 18 ? "Good afternoon" : "Good evening"}{(user?.displayName ?? user?.name) ? `, ${(user.displayName ?? user.name)!.split(" ")[0]}` : ""}.</h1><p>Make a little progress on what matters.</p></div><div className="heading-icon"><Sparkles size={19} /></div></div>
               <div className="overview-grid">
                 <div className="glass-panel overview-card"><span className="overview-icon mint-icon"><Clock3 size={17} /></span><span className="tile-label">FOCUS TIME</span><strong>{visibleMinutes}<small> min</small></strong><span className="tile-foot">{todaySessions.length} completed {todaySessions.length === 1 ? "session" : "sessions"} today</span></div>
                 <div className="glass-panel overview-card"><span className="overview-icon gold-icon"><Coins size={17} /></span><span className="tile-label">COIN BALANCE</span><strong>{data.coins}</strong><span className="tile-foot">{todayCoins} focus coins earned today</span></div>
@@ -544,6 +561,7 @@ export default function Dashboard() {
             <motion.section key="wallet" className="page-content" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
               <div className="page-heading"><div><span className="eyebrow">EARNED ONE MOMENT AT A TIME</span><h1>Your wallet</h1><p>Every coin started with a little effort.</p></div><div className="heading-icon gold-icon"><WalletCards size={19} /></div></div>
               <section className="glass-panel wallet-hero"><div className="wallet-coin-icon"><Coins size={23} /></div><span className="tile-label">AVAILABLE COINS</span><strong>{data.coins}</strong><p>Earn coins by focusing or finishing a task, then use them to unlock a mindful break.</p><button onClick={() => setView("entertainment")}>Browse rewards <ArrowRight size={14} /></button></section>
+              <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Extension account linking</h2><p>Generate a single-use pairing code for your signed-in account.</p></div></div><div className="extension-pairing-actions"><button type="button" disabled={pairingBusy} onClick={() => void createPairingCode()}>{pairingBusy ? "Creating code…" : "Create pairing code"}</button>{pairingCode && <div className="extension-pairing-code"><code>{pairingCode.code}</code><span>Expires {new Date(pairingCode.expiresAt).toLocaleTimeString()}. Use it only in the extension options page.</span><button type="button" onClick={() => setPairingCode(null)}>Hide code</button></div>}</div>{extensionSessions?.length ? <div className="session-list">{extensionSessions.map((session) => <div className="session-row" key={session.id}><div className="session-copy"><strong>Browser extension · {session.userId === user?._id ? "Your account" : "Beta account"}</strong><span>Expires {new Date(session.expiresAt).toLocaleString()}{session.revoked ? " · Revoked" : ""}</span></div>{!session.revoked && <button type="button" onClick={() => void revokeExtensionSession({ sessionId: session.id }).then(() => toast.success("Extension session revoked.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not revoke extension session."))}>Revoke</button>}</div>)}</div> : <p className="text-muted-foreground">No extension sessions are linked.</p>}</section>
               <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Coin activity</h2><p>Your recent earning and spending.</p></div></div>{walletTransactions.length ? <div className="session-list">{walletTransactions.map((transaction) => <div className="session-row wallet-entry" key={transaction.id}><span className={`wallet-activity-icon ${transaction.amount < 0 ? "spent" : "earned"}`}><Coins size={14} /></span><div className="session-copy"><strong>{transaction.description}</strong><span>{shortDate(transaction.createdAt)}</span></div><span className={`wallet-amount ${transaction.amount < 0 ? "spent" : "earned"}`}>{transaction.amount > 0 ? "+" : "−"}{Math.abs(transaction.amount)}</span></div>)}</div> : <div className="empty-state"><span className="empty-icon"><WalletCards size={19} /></span><strong>Your wallet is ready</strong><span>Complete a focus session or task to earn your first coins.</span></div>}</section>
             </motion.section>
           ) : view === "statistics" ? (
@@ -580,9 +598,9 @@ export default function Dashboard() {
           )}
         </div>
         <footer className="main-footer"><span>Focus Rewards <span className="brand-period">·</span> focus first, enjoy it after</span><span>{snapshot?.initialized ? "Synced securely to your account" : "Connecting to your account…"}</span></footer>
-        {migrationError && !migrationPreview && <div className="glass-panel migration-notice" role="alert"><strong>Saved data needs review</strong><p>{migrationError}</p></div>}
-        {migrationNotice && <div className="glass-panel migration-notice" role="status"><strong>Migration complete</strong><p>{migrationNotice}</p><button type="button" onClick={() => setMigrationNotice(null)}>Dismiss</button></div>}
-        {migrationPreview && !snapshot?.migrationCompletedAt && <div className="migration-backdrop"><section className="glass-panel migration-dialog" role="dialog" aria-modal="true" aria-labelledby="migration-title"><span className="eyebrow">ONE-TIME ACCOUNT IMPORT</span><h2 id="migration-title">Review your saved rewards</h2><p>We found Focus Rewards data stored on this browser. It will only be imported into the signed-in account shown in the header.</p><dl><div><dt>Current saved balance</dt><dd>{migrationPreview.snapshot.coins} coins</dd></div><div><dt>Wallet event total</dt><dd>{migrationPreview.eventNet} coins</dd></div><div><dt>Balance reconciliation</dt><dd>{migrationPreview.reconcileCoins > 0 ? "+" : ""}{migrationPreview.reconcileCoins} coins</dd></div><div><dt>Tasks / sessions / purchases</dt><dd>{migrationPreview.snapshot.tasks.length} / {migrationPreview.snapshot.sessions.length} / {migrationPreview.snapshot.videoUnlocks.length}</dd></div></dl>{migrationPreview.warnings.map((warning) => <p className="migration-warning" key={warning}>{warning}</p>)}<p className="migration-footnote">Your exact original data will be backed up before import. The backup and localStorage entry are never deleted automatically.</p><div className="migration-actions"><button type="button" className="migration-secondary" onClick={() => setMigrationPreview(null)}>Not now</button><button type="button" disabled={migrationBusy || migrationPreview.reconcileCoins < 0} onClick={() => void confirmLegacyMigration()}>{migrationBusy ? "Importing…" : "Import and reconcile"}</button></div>{migrationError && <p className="migration-warning" role="alert">{migrationError}</p>}</section></div>}
+        {user?.role === "admin" && migrationError && !migrationPreview && <div className="glass-panel migration-notice" role="alert"><strong>Saved data needs review</strong><p>{migrationError}</p></div>}
+        {user?.role === "admin" && migrationNotice && <div className="glass-panel migration-notice" role="status"><strong>Migration complete</strong><p>{migrationNotice}</p><button type="button" onClick={() => setMigrationNotice(null)}>Dismiss</button></div>}
+        {user?.role === "admin" && migrationPreview && !snapshot?.migrationCompletedAt && <div className="migration-backdrop"><section className="glass-panel migration-dialog" role="dialog" aria-modal="true" aria-labelledby="migration-title"><span className="eyebrow">ONE-TIME ACCOUNT IMPORT</span><h2 id="migration-title">Review your saved rewards</h2><p>We found Focus Rewards data stored on this browser. It will only be imported into the signed-in account shown in the header.</p><dl><div><dt>Current saved balance</dt><dd>{migrationPreview.snapshot.coins} coins</dd></div><div><dt>Wallet event total</dt><dd>{migrationPreview.eventNet} coins</dd></div><div><dt>Balance reconciliation</dt><dd>{migrationPreview.reconcileCoins > 0 ? "+" : ""}{migrationPreview.reconcileCoins} coins</dd></div><div><dt>Tasks / sessions / purchases</dt><dd>{migrationPreview.snapshot.tasks.length} / {migrationPreview.snapshot.sessions.length} / {migrationPreview.snapshot.videoUnlocks.length}</dd></div></dl>{migrationPreview.warnings.map((warning) => <p className="migration-warning" key={warning}>{warning}</p>)}<p className="migration-footnote">Your exact original data will be backed up before import. The backup and localStorage entry are never deleted automatically.</p><div className="migration-actions"><button type="button" className="migration-secondary" onClick={() => setMigrationPreview(null)}>Not now</button><button type="button" disabled={migrationBusy || migrationPreview.reconcileCoins < 0} onClick={() => void confirmLegacyMigration()}>{migrationBusy ? "Importing…" : "Import and reconcile"}</button></div>{migrationError && <p className="migration-warning" role="alert">{migrationError}</p>}</section></div>}
       </main>
       <nav className="mobile-nav" aria-label="Mobile navigation">
         {nav.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? "mobile-active" : ""} onClick={() => setView(id)}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></button>)}

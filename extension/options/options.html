@@ -18,6 +18,20 @@
         <input id="youtube-price-enabled" type="checkbox" />
       </label>
       <p id="save-status" class="status" role="status" aria-live="polite"></p>
+      <section class="account-settings" aria-labelledby="extension-account-heading">
+        <p class="eyebrow">ACCOUNT</p>
+        <h1 id="extension-account-heading">Link your Focus Rewards account</h1>
+        <p class="description">On the signed-in Focus Rewards dashboard, create an extension pairing code, then enter it here. Codes work once and expire after five minutes.</p>
+        <form id="pair-form">
+          <label for="convex-site-url">Convex site URL</label>
+          <input id="convex-site-url" type="url" inputmode="url" placeholder="https://your-deployment.convex.site" autocomplete="url" required />
+          <label for="pairing-code">Pairing code</label>
+          <input id="pairing-code" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" minlength="32" maxlength="32" required />
+          <button id="pair-button" type="submit">Link this extension</button>
+        </form>
+        <div id="account-status" class="account-status" role="status" aria-live="polite">Checking extension account…</div>
+        <button id="revoke-button" type="button" hidden>Sign out and revoke this extension</button>
+      </section>
       <p class="note">Estimated at 1.2 coins per minute, rounded up. Shorts and live streams are excluded.</p>
     </main>
   </body>

@@ -16,6 +16,14 @@ const AuthPage = lazy(() => import("./pages/Auth.tsx"));
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
 const NotFound = lazy(() => import("./pages/NotFound.tsx"));
 
+function ProtectedRoutes() {
+  return <Routes>
+    <Route path="/dashboard" element={<RequireAuth title="Sign in to open your rewards space" description="Your personal dashboard, focus timer, tasks and coin wallet are waiting."><Dashboard /></RequireAuth>} />
+    <Route path="/admin" element={<RequireAuth title="Sign in to administer Focus Rewards" description="Manage private beta access and invitations."><Admin /></RequireAuth>} />
+    <Route path="*" element={<NotFound />} />
+  </Routes>;
+}
+
 // Simple loading fallback for route transitions
 function RouteLoading() {
   return (
@@ -118,27 +126,13 @@ createRoot(document.getElementById("root")!).render(
       <ConvexAuthProvider client={convex}>
         <BrowserRouter>
           <RouteSyncer />
-          <BetaGate>
-            <Suspense fallback={<RouteLoading />}>
-              <Routes>
+          <Suspense fallback={<RouteLoading />}>
+            <Routes>
               <Route path="/" element={<Landing />} />
-              <Route
-                path="/auth"
-                element={<AuthPage redirectAfterAuth="/dashboard" />}
-              />
-              <Route
-                path="/dashboard"
-                element={
-                  <RequireAuth title="Sign in to open your rewards space" description="Your personal dashboard, focus timer, tasks and coin wallet are waiting." >
-                    <Dashboard />
-                  </RequireAuth>
-                }
-              />
-                <Route path="/admin" element={<RequireAuth title="Sign in to administer Focus Rewards" description="Manage private beta access and invitations."><Admin /></RequireAuth>} />
-                <Route path="*" element={<NotFound />} />
-              </Routes>
-            </Suspense>
-          </BetaGate>
+              <Route path="/auth" element={<AuthPage redirectAfterAuth="/dashboard" />} />
+              <Route path="*" element={<BetaGate><ProtectedRoutes /></BetaGate>} />
+            </Routes>
+          </Suspense>
         </BrowserRouter>
         <Toaster />
       </ConvexAuthProvider>
