@@ -1,15 +1,13 @@
 (function (root) {
   "use strict";
 
-  let COINS_PER_MINUTE = 1.2;
+  const MAX_COINS_PER_MINUTE = 100;
 
-  function setCoinsPerMinute(value) {
-    if (Number.isFinite(value) && value > 0 && value <= 100) COINS_PER_MINUTE = value;
-  }
-
-  function priceForDurationSeconds(durationSeconds) {
-    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return null;
-    return Math.max(1, Math.ceil((durationSeconds / 60) * COINS_PER_MINUTE));
+  function priceForDurationSeconds(durationSeconds, coinsPerMinute = 1.2) {
+    if (typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds <= 0
+      || typeof coinsPerMinute !== "number" || !Number.isFinite(coinsPerMinute)
+      || coinsPerMinute <= 0 || coinsPerMinute > MAX_COINS_PER_MINUTE) return null;
+    return Math.max(1, Math.ceil((durationSeconds * Math.round(coinsPerMinute * 100)) / 6000));
   }
 
   function parseDurationSeconds(value) {
@@ -40,8 +38,6 @@
   }
 
   root.FocusRewardsPricing = Object.freeze({
-    get COINS_PER_MINUTE() { return COINS_PER_MINUTE; },
-    setCoinsPerMinute,
     parseDurationSeconds,
     priceForDurationSeconds,
   });

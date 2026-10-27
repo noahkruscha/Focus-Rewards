@@ -1,51 +1,99 @@
 .fr-youtube-purchase {
-  display: flex;
+  --fr-ink: #f1f4f2;
+  --fr-muted: #b6c0bc;
+  --fr-mint: #bdebd2;
+  --fr-gold: #efd898;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 7px 12px;
   width: min(100%, 640px);
   margin: 8px 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(225, 190, 110, 0.24);
-  border-radius: 10px;
-  background: rgba(20, 22, 25, 0.94);
-  color: #eee;
-  font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: 12px 14px;
+  border: 1px solid rgba(235, 242, 238, .14);
+  border-radius: 14px;
+  background: rgba(20, 24, 25, .94);
+  color: var(--fr-ink);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .2);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
-.fr-youtube-purchase strong { color: #e4c780; }
-.fr-youtube-purchase button {
-  padding: 7px 10px;
-  border: 1px solid rgba(225, 190, 110, 0.3);
-  border-radius: 7px;
-  background: rgba(225, 190, 110, 0.11);
-  color: #f2dfb2;
-  font: inherit;
-  cursor: pointer;
+.fr-youtube-purchase strong {
+  color: #f1f4f2;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -.15px;
 }
-.fr-youtube-purchase button:disabled { cursor: wait; opacity: 0.6; }
-.fr-youtube-message { color: #a9b1b3; }
+
+.fr-youtube-purchase button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  min-height: 40px;
+  max-width: min(48vw, 280px);
+  padding: 9px 13px;
+  border: 1px solid rgba(151, 224, 187, .35);
+  border-radius: 10px;
+  background: rgba(116, 197, 153, .16);
+  color: var(--fr-mint);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.35;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+
+.fr-youtube-purchase button:hover:not(:disabled) {
+  border-color: rgba(151, 224, 187, .58);
+  background: rgba(116, 197, 153, .24);
+}
+
+.fr-youtube-purchase button:focus-visible {
+  outline: 2px solid #baf0d0;
+  outline-offset: 3px;
+}
+
+.fr-youtube-purchase button:disabled { cursor: wait; opacity: .62; }
+.fr-youtube-purchase button[hidden] { display: none; }
+.fr-youtube-message { grid-column: 1; color: var(--fr-muted); font-size: 11px; line-height: 1.5; }
 
 .fr-youtube-price {
   display: inline-flex !important;
-  flex: 0 0 auto !important;
+  min-height: 26px !important;
   align-items: center !important;
-  gap: 4px !important;
-  min-height: 24px !important;
+  gap: 5px !important;
   margin: 0 auto 0 0 !important;
-  padding: 0 8px !important;
-  border: 1px solid rgba(225, 190, 110, 0.16) !important;
+  padding: 0 9px !important;
+  border: 1px solid rgba(232, 203, 141, .24) !important;
   border-radius: 999px !important;
-  background: rgba(225, 190, 110, 0.075) !important;
-  color: rgba(238, 214, 157, 0.88) !important;
-  font: 500 11px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
-  letter-spacing: 0.01em !important;
+  background: rgba(232, 203, 141, .1) !important;
+  color: #f0dca9 !important;
+  font: 550 11px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+  letter-spacing: .01em !important;
   white-space: nowrap !important;
   cursor: help !important;
-  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease !important;
+  transition: background-color 140ms ease, border-color 140ms ease !important;
 }
 
 .fr-youtube-price:hover {
-  border-color: rgba(225, 190, 110, 0.3) !important;
-  background: rgba(225, 190, 110, 0.13) !important;
-  color: #f2dfb2 !important;
+  border-color: rgba(232, 203, 141, .42) !important;
+  background: rgba(232, 203, 141, .16) !important;
+}
+
+@media (max-width: 600px) {
+  .fr-youtube-purchase {
+    width: calc(100% - 16px);
+    margin: 6px 8px;
+    padding: 10px 11px;
+    gap: 6px 9px;
+    border-radius: 12px;
+  }
+
+  .fr-youtube-purchase button { max-width: 44vw; padding: 8px 10px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fr-youtube-purchase button, .fr-youtube-price { transition-duration: .01ms !important; }
 }

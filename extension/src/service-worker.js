@@ -5,6 +5,7 @@
   const EXPIRY_KEY = "focusRewardsExtensionExpiresAt";
   const ENDPOINT_KEY = "focusRewardsConvexSiteUrl";
   const OPTIONS_URL = chrome.runtime.getURL("options/options.html");
+  const POPUP_URL = chrome.runtime.getURL("popup/popup.html");
 
   function normalizeSiteUrl(value) {
     if (typeof value !== "string") return null;
@@ -81,28 +82,40 @@
       return { ok: false, kind: "unauthorized", error: "SESSION_REQUIRED" };
     }
     const headers = { Authorization: `Bearer ${credential.token}` };
+    if (type === "youtube-pricing-rates") {
+      const response = await sendJson(`${credential.siteUrl}/extension/youtube/pricing-rates`, { method: "GET", headers });
+      if (response.response.status === 401) {
+        await clearCredential();
+        return { ok: false, kind: "unauthorized", error: "SESSION_REQUIRED" };
+      }
+      const rates = response.body;
+      if (!response.response.ok || ![rates.standardCoinsPerMinute, rates.shortsCoinsPerMinute, rates.flexibleCoinsPerMinute]
+        .every((rate) => Number.isFinite(rate) && rate > 0 && rate <= 100 && Math.abs(rate * 100 - Math.round(rate * 100)) < 1e-8)) {
+        return { ok: false, kind: response.response.status === 503 ? "network" : "rejected", message: "The server returned invalid pricing settings." };
+      }
+      return { ok: true, ...rates, flexibleUsageEnabled: rates.flexibleUsageEnabled === true };
+    }
     if (type === "youtube-quote") {
-      const params = new URLSearchParams({
-        videoId: message.videoId,
-        contentType: message.contentType,
-        durationSeconds: String(message.durationSeconds),
+      const response = await sendJson(`${credential.siteUrl}/extension/youtube/quote`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId: message.videoId, contentType: message.contentType, durationSeconds: message.durationSeconds }),
       });
-      const response = await sendJson(`${credential.siteUrl}/extension/youtube/quote?${params}`, { method: "GET", headers });
       if (response.response.status === 401) {
         await clearCredential();
         return { ok: false, kind: "unauthorized", error: "SESSION_REQUIRED" };
       }
       if (response.response.status === 503) return { ok: false, kind: "network", error: "NETWORK_ERROR" };
-      if (!response.response.ok || !Number.isSafeInteger(response.body.price) || !Number.isSafeInteger(response.body.entitlementDays)) {
+      if (!response.response.ok || typeof response.body.quoteId !== "string" || !Number.isSafeInteger(response.body.price) || !Number.isFinite(response.body.rateCoinsPerMinute) || !Number.isSafeInteger(response.body.entitlementDays)) {
         return { ok: false, kind: "rejected", error: "QUOTE_REJECTED" };
       }
-      return { ok: true, price: response.body.price, entitlementDays: response.body.entitlementDays };
+      return { ok: true, quoteId: response.body.quoteId, price: response.body.price, rateCoinsPerMinute: response.body.rateCoinsPerMinute, entitlementDays: response.body.entitlementDays };
     }
     if (type === "youtube-purchase") {
       const response = await sendJson(`${credential.siteUrl}/extension/youtube/purchase`, {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ videoId: message.videoId, contentType: message.contentType, durationSeconds: message.durationSeconds, idempotencyKey: message.idempotencyKey }),
+        body: JSON.stringify({ videoId: message.videoId, contentType: message.contentType, durationSeconds: message.durationSeconds, idempotencyKey: message.idempotencyKey, quoteId: message.quoteId }),
       });
       if (response.response.status === 401) {
         await clearCredential();
@@ -146,8 +159,9 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!sender.id || sender.id !== chrome.runtime.id || !message || typeof message.type !== "string") return false;
     const fromOptions = sender.url === OPTIONS_URL;
+    const fromPopup = sender.url === POPUP_URL;
     const fromYouTubePage = sender.tab !== undefined && typeof sender.url === "string"
-      && /^https:\/\/www\.youtube\.com\/(?:watch(?:\?|$)|shorts\/[A-Za-z0-9_-]{11}(?:\?|$))/.test(sender.url);
+      && /^https:\/\/www\.youtube\.com\//.test(sender.url);
     if (fromOptions) {
       const request = message.type === "pair" ? pair(message)
         : message.type === "status" ? status()
@@ -156,7 +170,11 @@
       request.then(sendResponse).catch(() => sendResponse({ ok: false, kind: "network", message: "The request failed. Check your connection and try again." }));
       return true;
     }
-    if (!fromYouTubePage || !["status", "youtube-quote", "youtube-purchase", "youtube-entitlement"].includes(message.type)) return false;
+    if (fromPopup && message.type === "status") {
+      status().then(sendResponse).catch(() => sendResponse({ ok: false, kind: "network", message: "The extension session could not be checked." }));
+      return true;
+    }
+    if (!fromYouTubePage || !["status", "youtube-quote", "youtube-purchase", "youtube-entitlement", "youtube-pricing-rates"].includes(message.type)) return false;
     const request = message.type === "status" ? status() : youtubeRequest(message.type, message);
     request.then(sendResponse).catch(() => sendResponse({ ok: false, kind: "network", message: "The request failed. Check your connection and try again." }));
     return true;

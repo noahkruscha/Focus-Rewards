@@ -753,3 +753,16 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+.youtube-rate-form { display: grid; gap: 14px; }
+.youtube-rate-field { display: grid; gap: 7px; }
+.youtube-rate-field > label { color: #d8e1dc; font-size: 12px; font-weight: 600; }
+.youtube-rate-field > div { display: flex; align-items: center; gap: 10px; }
+.youtube-rate-field > div input { max-width: 190px; }
+.youtube-rate-field > div > span { color: #9ca9a2; font-size: 12px; white-space: nowrap; }
+.youtube-rate-field small { color: #9ca9a2; font-size: 11px; line-height: 1.55; }
+.youtube-rate-disabled { padding-top: 11px; border-top: 1px solid rgba(255,255,255,.08); }
+.pairing-code-dialog-result { display: grid; justify-items: center; gap: 12px; padding: 18px; }
+.pairing-code-dialog-result code { color: #e5d293; font-size: clamp(16px, 4vw, 23px); font-variant-numeric: tabular-nums; letter-spacing: .14em; overflow-wrap: anywhere; text-align: center; }
+.pairing-code-dialog-result span { color: #a1ada6; font-size: 12px; }
+.pairing-code-dialog-result button, .youtube-rate-form button { min-height: 40px; padding: 9px 14px; border: 1px solid rgba(140,231,198,.18); border-radius: 9px; background: linear-gradient(135deg,#b3f1d5,#7dd2af); color: #10241b; font-size: 12px; font-weight: 650; }
+.youtube-rate-form button:disabled { cursor: wait; opacity: .6; }

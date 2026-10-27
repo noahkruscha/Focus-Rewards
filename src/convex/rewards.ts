@@ -9,16 +9,30 @@ const TASK_REWARD_MAX = 1000;
 const MAX_SESSION_MINUTES = 180;
 const YOUTUBE_ENTITLEMENT_DAYS = 30;
 const YOUTUBE_MAX_DURATION_SECONDS = 6 * 60 * 60;
-const DEFAULT_YOUTUBE_UNLOCK_PRICE_COINS = 36;
-const MAX_YOUTUBE_UNLOCK_PRICE_COINS = 10_000;
+const DEFAULT_YOUTUBE_RATES = {
+  standardCoinsPerMinute: 1.2,
+  shortsCoinsPerMinute: 1.4,
+  flexibleCoinsPerMinute: 1.6,
+} as const;
+const MAX_YOUTUBE_RATE = 100;
 
-function youtubeUnlockPrice() {
-  const configured = process.env.YOUTUBE_UNLOCK_PRICE_COINS;
-  if (configured === undefined || configured.trim() === "") return DEFAULT_YOUTUBE_UNLOCK_PRICE_COINS;
-  const price = Number(configured);
-  if (!Number.isSafeInteger(price) || price < 1 || price > MAX_YOUTUBE_UNLOCK_PRICE_COINS) {
-    throw new ConvexError("YouTube unlock price is misconfigured.");
+function validYouTubeRate(rate: number) {
+  const hundredths = Math.round(rate * 100);
+  return Number.isFinite(rate) && rate > 0 && rate <= MAX_YOUTUBE_RATE
+    && Math.abs(rate * 100 - hundredths) < 1e-8;
+}
+
+function validateYouTubeRates(rates: { standardCoinsPerMinute: number; shortsCoinsPerMinute: number; flexibleCoinsPerMinute: number }) {
+  if (!validYouTubeRate(rates.standardCoinsPerMinute) || !validYouTubeRate(rates.shortsCoinsPerMinute)
+    || !validYouTubeRate(rates.flexibleCoinsPerMinute)) {
+    throw new ConvexError("Each YouTube rate must be greater than 0 and no more than 100 Coins per minute.");
   }
+  return rates;
+}
+
+function youtubePrice(rate: number, durationSeconds: number) {
+  const price = Math.ceil((durationSeconds * Math.round(rate * 100)) / 6000);
+  if (!Number.isSafeInteger(price) || price < 1) throw new ConvexError("Calculated YouTube price is invalid.");
   return price;
 }
 
@@ -36,7 +50,7 @@ function validateYouTubePurchaseDetails(videoId: string, contentType: string, du
     || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0 || durationSeconds > YOUTUBE_MAX_DURATION_SECONDS) {
     throw new ConvexError("Invalid YouTube purchase request.");
   }
-  // Duration is validated and recorded as client-reported metadata only; it never affects the server price.
+  // Duration is validated client-reported metadata and an input to the server's rate calculation; the client cannot submit or override the resulting price.
 }
 const LEGACY_TRANSACTION_TYPES = {
   focus: "legacy_focus_reward",
@@ -105,6 +119,30 @@ export const initialize = mutation({
     const existing = await accountFor(ctx, userId);
     if (existing) return existing._id;
     return await ctx.db.insert("accountData", { userId, coins: 0, dailyCap: 120, taskBonus: 5 });
+  },
+});
+
+export const youtubePricingRates = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await authenticatedUserId(ctx);
+    const user = await ctx.db.get(userId);
+    const rates = user?.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES;
+    return validateYouTubeRates(rates);
+  },
+});
+
+export const setYouTubePricingRates = mutation({
+  args: {
+    standardCoinsPerMinute: v.number(),
+    shortsCoinsPerMinute: v.number(),
+    flexibleCoinsPerMinute: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const userId = await authenticatedUserId(ctx);
+    const rates = validateYouTubeRates(args);
+    await ctx.db.patch(userId, { youtubePricingRates: rates });
+    return rates;
   },
 });
 
@@ -237,6 +275,7 @@ export async function purchaseYouTubeEntitlement(ctx: MutationCtx, args: {
   contentType: "youtube_video" | "youtube_short";
   durationSeconds: number;
   idempotencyKey: string;
+  quoteId: Id<"youtubePurchaseQuotes">;
   now?: number;
 }) {
   const { userId, videoId, contentType, durationSeconds, idempotencyKey } = args;
@@ -257,8 +296,17 @@ export async function purchaseYouTubeEntitlement(ctx: MutationCtx, args: {
     return { success: true as const, alreadyOwned: false, alreadyProcessed: true, price: existingRequest.cost, expiresAt: previousExpiresAt };
   }
 
-  // Duration is validated and recorded as metadata; it never changes the deployment-configured server price.
-  const price = youtubeUnlockPrice();
+  const quote = args.quoteId ? await ctx.db.get(args.quoteId) : null;
+  if (!quote || quote.userId !== userId || quote.videoId !== videoId || quote.contentType !== contentType
+    || quote.durationSeconds !== durationSeconds || quote.expiresAt <= (args.now ?? Date.now())
+    || (quote.redeemedAt !== undefined && quote.idempotencyKey !== `youtube:${idempotencyKey}`)) {
+    throw new ConvexError("Pricing quote is invalid or expired. Request a new quote.");
+  }
+  const owner = await ctx.db.get(userId);
+  if (!owner) throw new ConvexError("Account not found.");
+  validateYouTubeRates(owner.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES);
+  const rate = quote.rateCoinsPerMinute;
+  const price = quote.price;
   const now = args.now ?? Date.now();
   const matchingEntitlements = await ctx.db.query("libraryPurchases")
     .withIndex("by_user_content", (q) => q.eq("userId", userId).eq("contentType", contentType).eq("contentId", videoId))
@@ -305,11 +353,28 @@ export async function purchaseYouTubeEntitlement(ctx: MutationCtx, args: {
     purchasedAt: now,
     expiresAt,
     idempotencyKey: purchaseIdempotencyKey,
+    youtubeRateCoinsPerMinute: rate,
   });
+  await ctx.db.patch(quote._id, { redeemedAt: now, idempotencyKey: purchaseIdempotencyKey });
   return { success: true as const, alreadyOwned: false, alreadyProcessed: false, price, expiresAt };
 }
 
-export const youtubePurchaseQuote = internalQuery({
+export const extensionYouTubePricingRates = internalQuery({
+  args: { tokenHash: v.string(), now: v.number() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();
+    if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) throw new ConvexError("Extension session is expired or revoked.");
+    const user = await ctx.db.get(session.userId);
+    if (!user || user.isAnonymous || !hasCompletedProfile(user)) throw new ConvexError("Extension session is expired or revoked.");
+    if (process.env.BETA_REQUIRE_APPROVAL !== "false") {
+      const access = await accessFor(ctx, session.userId);
+      if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
+    }
+    return validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES);
+  },
+});
+
+export const youtubePurchaseQuote = internalMutation({
   args: { tokenHash: v.string(), videoId: v.string(), contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")), durationSeconds: v.number(), now: v.number() },
   handler: async (ctx, args) => {
     const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();
@@ -320,8 +385,24 @@ export const youtubePurchaseQuote = internalQuery({
       const access = await accessFor(ctx, session.userId);
       if (access?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
     }
+    const expiredQuotes = await ctx.db.query("youtubePurchaseQuotes")
+      .withIndex("by_expiry", (q) => q.lte("expiresAt", args.now)).take(100);
+    for (const expiredQuote of expiredQuotes) await ctx.db.delete(expiredQuote._id);
     validateYouTubePurchaseDetails(args.videoId, args.contentType, args.durationSeconds);
-    return { price: youtubeUnlockPrice(), entitlementDays: YOUTUBE_ENTITLEMENT_DAYS };
+    const rates = validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES);
+    const rate = args.contentType === "youtube_short" ? rates.shortsCoinsPerMinute : rates.standardCoinsPerMinute;
+    const price = youtubePrice(rate, args.durationSeconds);
+    const quoteId = await ctx.db.insert("youtubePurchaseQuotes", {
+      userId: session.userId,
+      videoId: args.videoId,
+      contentType: args.contentType,
+      durationSeconds: args.durationSeconds,
+      rateCoinsPerMinute: rate,
+      price,
+      createdAt: args.now,
+      expiresAt: args.now + 5 * 60_000,
+    });
+    return { quoteId, price, rateCoinsPerMinute: rate, entitlementDays: YOUTUBE_ENTITLEMENT_DAYS };
   },
 });
 
@@ -344,7 +425,7 @@ export const verifyYouTubeEntitlement = internalQuery({
     });
     if (!entitlement) return null;
     const expiresAt = entitlement.expiresAt ?? entitlement.purchasedAt + (entitlement.entitlementDays ?? YOUTUBE_ENTITLEMENT_DAYS) * 86400000;
-    return { expiresAt, durationSeconds: entitlement.durationSeconds ?? null };
+    return { expiresAt, durationSeconds: entitlement.durationSeconds ?? null, cost: entitlement.cost };
   },
 });
 
@@ -371,7 +452,10 @@ export const purchaseYouTubeReward = internalMutation({
   args: {
     tokenHash: v.string(), videoId: v.string(),
     contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")),
-    durationSeconds: v.number(), idempotencyKey: v.string(), now: v.number(),
+    durationSeconds: v.number(),
+    idempotencyKey: v.string(),
+    quoteId: v.id("youtubePurchaseQuotes"),
+    now: v.number(),
   },
   handler: async (ctx, args) => {
     const session = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash)).unique();

@@ -2,7 +2,8 @@
   "use strict";
 
   const SETTING = "youtubePriceIndicatorEnabled";
-  const ESTIMATE_RATE_KEY = "focusRewardsYoutubeCoinsPerMinute";
+  const DEFAULT_STANDARD_RATE = 1.2;
+  const DEFAULT_SHORTS_RATE = 1.4;
   const CARD_SELECTOR = "ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer";
   const DURATION_SELECTOR = "ytd-thumbnail-overlay-time-status-renderer, yt-thumbnail-badge-view-model";
   const BADGE_CLASS = "fr-youtube-price";
@@ -14,6 +15,7 @@
   let activeContentKey = null;
   let observer;
   let scanTimer = 0;
+  let pricingRates = { standardCoinsPerMinute: DEFAULT_STANDARD_RATE, shortsCoinsPerMinute: DEFAULT_SHORTS_RATE, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false };
 
   function isLive(card) {
     return Array.from(card.querySelectorAll(LIVE_OR_DURATION_SELECTOR)).some((node) => {
@@ -89,7 +91,10 @@
     const accountKey = accountState.signedIn ? "linked" : "unlinked";
     let panel = document.querySelector(".fr-youtube-purchase");
     if (panel?.dataset.contentKey === contentKey && panel.dataset.accountState === accountKey
-      && panel.dataset.durationSeconds === String(durationSeconds)) return;
+      && panel.dataset.durationSeconds === String(durationSeconds)) {
+      if (accountState.signedIn && !panel.dataset.quoteId) void loadPurchaseQuote(content, durationSeconds, panel, panel.querySelector("button"), panel.querySelector(".fr-youtube-message"));
+      return;
+    }
     if (!panel) {
       panel = document.createElement("section");
       panel.className = "fr-youtube-purchase";
@@ -100,53 +105,58 @@
     panel.dataset.contentKey = contentKey;
     panel.dataset.accountState = accountKey;
     panel.dataset.durationSeconds = String(durationSeconds);
+    delete panel.dataset.quoteId;
+    delete panel.dataset.quoteRate;
     panel.replaceChildren();
     const heading = document.createElement("strong");
-    heading.textContent = "Focus Rewards";
+    heading.textContent = "Focus Rewards · YouTube-Freischaltung";
     const message = document.createElement("span");
     message.className = "fr-youtube-message";
+    message.setAttribute("role", "status");
+    message.setAttribute("aria-live", "polite");
     const action = document.createElement("button");
     action.type = "button";
-    action.textContent = accountState.signedIn ? "Preis wird geladen…" : "Focus Rewards-Konto verbinden";
+    action.textContent = accountState.signedIn ? "Preis wird geladen…" : "Konto verbinden";
     action.disabled = accountState.signedIn;
     action.addEventListener("click", async () => {
       if (purchaseSubmitting) return;
       if (!accountState.signedIn) {
         const optionsUrl = chrome.runtime.getURL("options/options.html");
         window.open(optionsUrl, "_blank", "noopener");
-        message.textContent = "Bitte verknüpfe zuerst dein Focus Rewards-Konto in den Erweiterungseinstellungen.";
+        message.textContent = "Verbinde zuerst dein Focus-Rewards-Konto in den Erweiterungseinstellungen.";
         return;
       }
       purchaseSubmitting = true;
       action.disabled = true;
-      message.textContent = "Freischaltung wird sicher beim Server geprüft…";
+      message.textContent = "Kauf wird sicher vom Server geprüft…";
       const result = await extensionRequest("youtube-purchase", {
         videoId: content.videoId,
         contentType: content.contentType,
         durationSeconds,
         idempotencyKey: pendingPurchase?.idempotencyKey || (pendingPurchase = { contentKey, idempotencyKey: makeIdempotencyKey() }).idempotencyKey,
+        quoteId: panel.dataset.quoteId,
       });
       if (result.ok) {
         pendingPurchase = null;
         if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) {
-          message.textContent = result.alreadyOwned ? "Du besitzt bereits eine gültige Freischaltung." : `Erfolgreich freigeschaltet. Gültig bis ${new Date(result.expiresAt).toLocaleDateString("de-DE")}.`;
+          message.textContent = result.alreadyOwned ? "Eine gültige Freischaltung wurde vom Server bestätigt." : `Kauf vom Server bestätigt. Gültig bis ${new Date(result.expiresAt).toLocaleDateString("de-DE")}.`;
           await verifyContentEntitlement(content, panel);
         }
       } else if (result.kind === "insufficient-coins") {
         pendingPurchase = null;
-        if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Du hast nicht genug Coins für diese Freischaltung.";
+        if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Dein Coin-Guthaben reicht für diese Freischaltung nicht aus.";
       } else if (result.kind === "unauthorized") {
         accountState = { ok: true, signedIn: false };
         pendingPurchase = null;
         if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Deine Anmeldung ist abgelaufen oder widerrufen. Bitte verknüpfe dein Konto erneut.";
       } else if (result.kind === "network") {
-        if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Netzwerkfehler. Der Kauf wurde nicht bestätigt; bitte erneut versuchen.";
+        if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Verbindungsfehler. Der Kauf ist nicht bestätigt. Bitte erneut versuchen.";
       } else {
         pendingPurchase = null;
         if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) message.textContent = "Der Kauf konnte nicht bestätigt werden. Bitte prüfe dein Konto und versuche es erneut.";
       }
       purchaseSubmitting = false;
-      if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) action.disabled = false;
+      if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`)      action.disabled = false;
     });
     if (panel.parentElement !== host) host.prepend(panel);
     panel.append(heading, action, message);
@@ -165,7 +175,10 @@
       action.disabled = true;
       return;
     }
-    action.textContent = `Mit ${quote.price} Coins freischalten (${quote.entitlementDays} Tage)`;
+    panel.dataset.quoteId = quote.quoteId;
+    panel.dataset.quoteRate = String(quote.rateCoinsPerMinute);
+    action.textContent = `Für ${quote.price} Coins freischalten · ${quote.entitlementDays} Tage`;
+    message.textContent = `Serverpreis: ${String(quote.rateCoinsPerMinute).replace(".", ",")} Coins pro Minute.`;
     action.disabled = false;
   }
 
@@ -177,11 +190,11 @@
     const message = panel.querySelector(".fr-youtube-message");
     if (!result.ok) {
       if (result.kind === "unauthorized") accountState = { ok: true, signedIn: false };
-      message.textContent = result.kind === "network" ? "Freischaltung offline nicht verifizierbar." : "Bitte melde dich in den Erweiterungseinstellungen an.";
+      message.textContent = result.kind === "network" ? "Offline kann der Server die Freischaltung nicht bestätigen." : "Melde dich in den Erweiterungseinstellungen an.";
       return;
     }
     if (result.unlocked) {
-      message.textContent = `Serverbestätigt freigeschaltet bis ${new Date(result.expiresAt).toLocaleDateString("de-DE")}.`;
+      message.textContent = `Serverbestätigt. Gültig bis ${new Date(result.expiresAt).toLocaleDateString("de-DE")}.`;
       const action = panel.querySelector("button");
       if (action) action.hidden = true;
     } else {
@@ -195,6 +208,16 @@
     return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
   }
 
+  function contentTypeForCard(card) {
+    const links = card.querySelectorAll("a[href]");
+    for (const link of links) {
+      try {
+        if (new URL(link.href, location.origin).pathname.startsWith("/shorts/")) return "youtube_short";
+      } catch { /* Ignore malformed YouTube card links. */ }
+    }
+    return "youtube_video";
+  }
+
   function updateCard(card) {
     const existing = card.querySelector(`.${BADGE_CLASS}`);
     const menu = findMenu(card);
@@ -204,7 +227,9 @@
       return;
     }
     const durationSeconds = durationFor(card);
-    const price = window.FocusRewardsPricing.priceForDurationSeconds(durationSeconds);
+    const contentType = contentTypeForCard(card);
+    const rate = contentType === "youtube_short" ? pricingRates.shortsCoinsPerMinute : pricingRates.standardCoinsPerMinute;
+    const price = window.FocusRewardsPricing.priceForDurationSeconds(durationSeconds, rate);
     if (price === null) {
       if (existing) removeBadge(card);
       return;
@@ -213,12 +238,11 @@
     const row = menu.parentElement || menu;
     const badge = existing || document.createElement("span");
     badge.className = BADGE_CLASS;
-    const label = `◈ ${price} ${price === 1 ? "coin" : "coins"}`;
+    const label = `◈ ${price} ${price === 1 ? "Coin" : "Coins"}`;
     if (badge.textContent !== label) badge.textContent = label;
-    const coinsPerMinute = window.FocusRewardsPricing.COINS_PER_MINUTE;
-    const tooltip = `Estimated value (${coinsPerMinute} coins per minute); the server quotes the purchase price.`;
+    const tooltip = `Geschätzter Wert (${String(rate).replace(".", ",")} Coins pro Minute); den Kaufpreis bestätigt der Server.`;
     if (badge.getAttribute("title") !== tooltip) badge.setAttribute("title", tooltip);
-    const accessibleLabel = `Estimated value: ${price} coins; the server quotes the final price.`;
+    const accessibleLabel = `Geschätzter Wert: ${price} Coins. Der endgültige Kaufpreis wird vom Server bestätigt.`;
     if (badge.getAttribute("aria-label") !== accessibleLabel) badge.setAttribute("aria-label", accessibleLabel);
     if (badge.dataset.durationSeconds !== String(durationSeconds)) badge.dataset.durationSeconds = String(durationSeconds);
     if (badge.dataset.price !== String(price)) badge.dataset.price = String(price);
@@ -265,25 +289,37 @@
       attributeFilter: ["aria-label", "href", "overlay-style"],
     });
 
-    window.addEventListener("popstate", scheduleScan);
-    document.addEventListener("yt-navigate-finish", scheduleScan);
+    const refreshPricingRates = () => {
+      void extensionRequest("youtube-pricing-rates").then((result) => {
+        if (result?.ok) {
+          pricingRates = result;
+          scheduleScan();
+        }
+      });
+    };
+    const handleNavigation = () => {
+      scheduleScan();
+      renderPurchaseUi();
+      refreshPricingRates();
+    };
+    window.addEventListener("popstate", handleNavigation);
+    document.addEventListener("yt-navigate-finish", handleNavigation);
     document.addEventListener("yt-page-data-updated", scheduleScan);
-    document.addEventListener("yt-navigate-finish", renderPurchaseUi);
-    window.addEventListener("popstate", renderPurchaseUi);
-    const accountChanged = () => { void extensionRequest("status").then((result) => { accountState = result; renderPurchaseUi(); }); };
+    const accountChanged = () => {
+      void extensionRequest("status").then((result) => {
+        accountState = result;
+        if (result?.signedIn) refreshPricingRates();
+        renderPurchaseUi();
+      });
+    };
     chrome.storage.onChanged.addListener((changes, areaName) => { if (areaName === "local") accountChanged(); });
-    void extensionRequest("status").then((result) => { accountState = result; renderPurchaseUi(); });
+    void extensionRequest("status").then((result) => { accountState = result; if (result?.signedIn) refreshPricingRates(); renderPurchaseUi(); });
 
-    chrome.storage.sync.get({ [SETTING]: true, [ESTIMATE_RATE_KEY]: 1.2 }, (settings) => {
-      window.FocusRewardsPricing.setCoinsPerMinute(Number(settings[ESTIMATE_RATE_KEY]) || 1.2);
-      setEnabled(settings[SETTING]);
-    });
+    chrome.storage.sync.get({ [SETTING]: true }, (settings) => setEnabled(settings[SETTING]));
+    refreshPricingRates();
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName === "sync" && changes[SETTING]) setEnabled(changes[SETTING].newValue);
-      if (areaName === "sync" && changes[ESTIMATE_RATE_KEY]) {
-        window.FocusRewardsPricing.setCoinsPerMinute(Number(changes[ESTIMATE_RATE_KEY].newValue));
-        scheduleScan();
-      }
+      if (areaName === "local") refreshPricingRates();
     });
   }
 
