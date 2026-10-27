@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Focus Rewards</title>
+    <link rel="stylesheet" href="popup.css" />
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="brand-row">
+        <span class="brand-mark" aria-hidden="true">◈</span>
+        <div><span class="brand-name">Focus Rewards</span><span class="brand-caption">YOUTUBE-ERWEITERUNG</span></div>
+      </header>
+      <section class="account-card" aria-labelledby="account-heading">
+        <div class="account-indicator" aria-hidden="true"><span id="connection-dot"></span></div>
+        <div class="account-copy">
+          <h1 id="account-heading">Konto wird geprüft…</h1>
+          <p id="account-detail" role="status" aria-live="polite">Verbindung zum Server wird überprüft.</p>
+        </div>
+      </section>
+      <button id="account-action" class="primary-action" type="button" disabled>Erweiterung einrichten</button>
+      <footer><span>Dein Focus-Rewards-Konto. Deine Freischaltungen.</span></footer>
+    </main>
+  </body>
+</html>

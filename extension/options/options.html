@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Focus Rewards settings</title>
+    <title>Focus Rewards – Erweiterungseinstellungen</title>
     <link rel="stylesheet" href="options.css" />
     <script src="options.js" defer></script>
   </head>
@@ -11,28 +11,28 @@
     <main class="settings-card">
       <div class="brand"><span class="coin">◈</span><span>Focus Rewards</span></div>
       <p class="eyebrow">YOUTUBE</p>
-      <h1>Video estimates</h1>
-      <p class="description">See an estimated coin value beneath regular video recommendations. Estimates use video duration and never change your balance or control playback.</p>
+      <h1>Video-Schätzungen</h1>
+      <p class="description">Sieh den geschätzten Coin-Wert bei regulären YouTube-Empfehlungen. Die Schätzung basiert auf der Videolänge und verändert weder dein Guthaben noch die Wiedergabe.</p>
       <label class="setting-row" for="youtube-price-enabled">
-        <span><strong>Show price estimates</strong><small>Hide or show the inline estimate on YouTube.</small></span>
+        <span><strong>Preisschätzungen anzeigen</strong><small>Die Coin-Schätzung direkt auf YouTube ein- oder ausblenden.</small></span>
         <input id="youtube-price-enabled" type="checkbox" />
       </label>
       <p id="save-status" class="status" role="status" aria-live="polite"></p>
       <section class="account-settings" aria-labelledby="extension-account-heading">
-        <p class="eyebrow">ACCOUNT</p>
-        <h1 id="extension-account-heading">Link your Focus Rewards account</h1>
-        <p class="description">On the signed-in Focus Rewards dashboard, create an extension pairing code, then enter it here. Codes work once and expire after five minutes.</p>
+        <p class="eyebrow">KONTO</p>
+        <h2 id="extension-account-heading">Focus-Rewards-Konto verbinden</h2>
+        <p class="description">Erstelle im angemeldeten Focus-Rewards-Dashboard einen Erweiterungscode und gib ihn hier ein. Der Code ist einmalig und läuft nach fünf Minuten ab.</p>
         <form id="pair-form">
-          <label for="convex-site-url">Convex site URL</label>
-          <input id="convex-site-url" type="url" inputmode="url" placeholder="https://your-deployment.convex.site" autocomplete="url" required />
-          <label for="pairing-code">Pairing code</label>
+          <label for="convex-site-url">Convex-Site-URL</label>
+          <input id="convex-site-url" type="url" inputmode="url" placeholder="https://deine-deployment.convex.site" autocomplete="url" required />
+          <label for="pairing-code">Verbindungscode</label>
           <input id="pairing-code" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" minlength="32" maxlength="32" required />
-          <button id="pair-button" type="submit">Link this extension</button>
+          <button id="pair-button" type="submit">Erweiterung verbinden</button>
         </form>
-        <div id="account-status" class="account-status" role="status" aria-live="polite">Checking extension account…</div>
-        <button id="revoke-button" type="button" hidden>Sign out and revoke this extension</button>
+        <div id="account-status" class="account-status" role="status" aria-live="polite">Erweiterungskonto wird geprüft…</div>
+        <button id="revoke-button" type="button" hidden>Abmelden und Erweiterungssitzung widerrufen</button>
       </section>
-      <p class="note">Estimated at 1.2 coins per minute, rounded up. Shorts and live streams are excluded.</p>
+      <p class="note">Schätzungen verwenden die Tarife deines Focus-Rewards-Kontos: separat für Standardvideos und Shorts. Der endgültige Preis wird vor dem Kauf vom Server berechnet und bestätigt; Livestreams sind ausgeschlossen.</p>
     </main>
   </body>
 </html>

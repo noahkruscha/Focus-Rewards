@@ -43,6 +43,16 @@ import { useAuth } from "@/hooks/use-auth";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { useAction, useMutation, useQuery } from "convex/react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useNavigate } from "react-router";
 import { LEGACY_DATA_KEY, preserveLegacyBackup, previewLegacyMigration, type MigrationPreview } from "@/lib/legacyMigration";
 
@@ -82,6 +92,13 @@ const STORAGE_KEY = LEGACY_DATA_KEY;
 const DAILY_GOAL_MINUTES = 120;
 const ACTIVITIES: Activity[] = ["Studying", "Reading", "Coding"];
 const DURATIONS = [25, 45, 60];
+const DEFAULT_YOUTUBE_RATES = { standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6 };
+
+function validRateInput(input: string) {
+  if (!/^(?:\d+)(?:\.\d{1,2})?$/.test(input)) return false;
+  const rate = Number(input);
+  return Number.isFinite(rate) && rate > 0 && rate <= 100;
+}
 const SAMPLE_VIDEOS: SampleVideo[] = [
   { id: "quiet-morning", title: "A Quiet Morning in the Mountains", duration: "18 min", category: "Nature", price: 24, description: "Take a slow breath and wander through a peaceful mountain morning, from the first light to a quiet woodland trail.", colors: ["#36534c", "#a4bda0"], artwork: "☼" },
   { id: "studio-sessions", title: "Studio Sessions: Making Things by Hand", duration: "26 min", category: "Creative", price: 32, description: "A gentle look into the small decisions, sketches, and happy accidents that shape a thoughtful creative practice.", colors: ["#664d3c", "#d3a976"], artwork: "✳" },
@@ -163,10 +180,17 @@ export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const createExtensionPairingCode = useAction(api.access.createExtensionPairingCode);
+  const saveYouTubePricingRates = useMutation(api.rewards.setYouTubePricingRates);
+  const youtubePricingRates = useQuery(api.rewards.youtubePricingRates, user ? {} : "skip");
   const revokeExtensionSession = useMutation(api.access.revokeExtensionSession);
   const extensionSessions = useQuery(api.access.extensionSessions, user ? {} : "skip");
   const [pairingCode, setPairingCode] = useState<{ code: string; expiresAt: number } | null>(null);
   const [pairingBusy, setPairingBusy] = useState(false);
+  const [pairingSetupOpen, setPairingSetupOpen] = useState(false);
+  const [standardRateInput, setStandardRateInput] = useState(String(DEFAULT_YOUTUBE_RATES.standardCoinsPerMinute));
+  const [shortsRateInput, setShortsRateInput] = useState(String(DEFAULT_YOUTUBE_RATES.shortsCoinsPerMinute));
+  const [flexibleRateInput, setFlexibleRateInput] = useState(String(DEFAULT_YOUTUBE_RATES.flexibleCoinsPerMinute));
+  const [pairingCodeCopied, setPairingCodeCopied] = useState(false);
   const snapshot = useQuery(api.rewards.snapshot, user ? {} : "skip");
   const initializeAccount = useMutation(api.rewards.initialize);
   const setRemoteSettings = useMutation(api.rewards.setSettings);
@@ -441,15 +465,48 @@ export default function Dashboard() {
     void deleteRemoteTask({ taskId }).then(() => toast("Task removed.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Couldn't delete task."));
   }
 
-  async function createPairingCode() {
+  function openPairingSetup() {
+    if (!youtubePricingRates) return;
+    const rates = youtubePricingRates;
+    setStandardRateInput(String(rates.standardCoinsPerMinute));
+    setShortsRateInput(String(rates.shortsCoinsPerMinute));
+    setFlexibleRateInput(String(rates.flexibleCoinsPerMinute));
+    setPairingCode(null);
+    setPairingCodeCopied(false);
+    setPairingSetupOpen(true);
+  }
+
+  async function createPairingCode(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const rates = {
+      standardCoinsPerMinute: Number(standardRateInput),
+      shortsCoinsPerMinute: Number(shortsRateInput),
+      flexibleCoinsPerMinute: Number(flexibleRateInput),
+    };
+    if (!validRateInput(standardRateInput) || !validRateInput(shortsRateInput) || !validRateInput(flexibleRateInput)) {
+      toast.error("Rates must be between 0.01 and 100 Coins per minute, with up to two decimal places.");
+      return;
+    }
     setPairingBusy(true);
     try {
+      await saveYouTubePricingRates(rates);
       setPairingCode(await createExtensionPairingCode({}));
-      toast.success("Pairing code created. Enter it in the Focus Rewards extension within five minutes.");
+      toast.success("Rates saved and pairing code created. The code expires in five minutes.");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not create an extension pairing code.");
+      toast.error(error instanceof Error ? error.message : "Could not save rates or create a pairing code.");
     } finally {
       setPairingBusy(false);
+    }
+  }
+
+  async function copyPairingCode() {
+    if (!pairingCode) return;
+    try {
+      await navigator.clipboard.writeText(pairingCode.code);
+      setPairingCodeCopied(true);
+    } catch {
+      setPairingCodeCopied(false);
+      toast.error("Could not copy the code. Select and copy it manually.");
     }
   }
 
@@ -561,7 +618,7 @@ export default function Dashboard() {
             <motion.section key="wallet" className="page-content" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
               <div className="page-heading"><div><span className="eyebrow">EARNED ONE MOMENT AT A TIME</span><h1>Your wallet</h1><p>Every coin started with a little effort.</p></div><div className="heading-icon gold-icon"><WalletCards size={19} /></div></div>
               <section className="glass-panel wallet-hero"><div className="wallet-coin-icon"><Coins size={23} /></div><span className="tile-label">AVAILABLE COINS</span><strong>{data.coins}</strong><p>Earn coins by focusing or finishing a task, then use them to unlock a mindful break.</p><button onClick={() => setView("entertainment")}>Browse rewards <ArrowRight size={14} /></button></section>
-              <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Extension account linking</h2><p>Generate a single-use pairing code for your signed-in account.</p></div></div><div className="extension-pairing-actions"><button type="button" disabled={pairingBusy} onClick={() => void createPairingCode()}>{pairingBusy ? "Creating code…" : "Create pairing code"}</button>{pairingCode && <div className="extension-pairing-code"><code>{pairingCode.code}</code><span>Expires {new Date(pairingCode.expiresAt).toLocaleTimeString()}. Use it only in the extension options page.</span><button type="button" onClick={() => setPairingCode(null)}>Hide code</button></div>}</div>{extensionSessions?.length ? <div className="session-list">{extensionSessions.map((session) => <div className="session-row" key={session.id}><div className="session-copy"><strong>Browser extension · {session.userId === user?._id ? "Your account" : "Beta account"}</strong><span>Expires {new Date(session.expiresAt).toLocaleString()}{session.revoked ? " · Revoked" : ""}</span></div>{!session.revoked && <button type="button" onClick={() => void revokeExtensionSession({ sessionId: session.id }).then(() => toast.success("Extension session revoked.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not revoke extension session."))}>Revoke</button>}</div>)}</div> : <p className="text-muted-foreground">No extension sessions are linked.</p>}</section>
+              <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Extension account linking</h2><p>Generate a single-use pairing code for your signed-in account.</p></div></div><div className="extension-pairing-actions"><button type="button" disabled={pairingBusy || youtubePricingRates === undefined} onClick={openPairingSetup}>{youtubePricingRates === undefined ? "Loading rates…" : "Create pairing code"}</button>{pairingCode && <div className="extension-pairing-code"><code>{pairingCode.code}</code><button type="button" onClick={() => void copyPairingCode()}>{pairingCodeCopied ? "Copied" : "Copy code"}</button><span>Expires {new Date(pairingCode.expiresAt).toLocaleTimeString()}. Use it only in the extension options page.</span></div>}</div>{extensionSessions?.length ? <div className="session-list">{extensionSessions.map((session) => <div className="session-row" key={session.id}><div className="session-copy"><strong>Browser extension · {session.userId === user?._id ? "Your account" : "Beta account"}</strong><span>Expires {new Date(session.expiresAt).toLocaleString()}{session.revoked ? " · Revoked" : ""}</span></div>{!session.revoked && <button type="button" onClick={() => void revokeExtensionSession({ sessionId: session.id }).then(() => toast.success("Extension session revoked.")).catch((error: unknown) => toast.error(error instanceof Error ? error.message : "Could not revoke extension session."))}>Revoke</button>}</div>)}</div> : <p className="text-muted-foreground">No extension sessions are linked.</p>}</section>
               <section className="glass-panel history-panel"><div className="section-heading"><div><h2>Coin activity</h2><p>Your recent earning and spending.</p></div></div>{walletTransactions.length ? <div className="session-list">{walletTransactions.map((transaction) => <div className="session-row wallet-entry" key={transaction.id}><span className={`wallet-activity-icon ${transaction.amount < 0 ? "spent" : "earned"}`}><Coins size={14} /></span><div className="session-copy"><strong>{transaction.description}</strong><span>{shortDate(transaction.createdAt)}</span></div><span className={`wallet-amount ${transaction.amount < 0 ? "spent" : "earned"}`}>{transaction.amount > 0 ? "+" : "−"}{Math.abs(transaction.amount)}</span></div>)}</div> : <div className="empty-state"><span className="empty-icon"><WalletCards size={19} /></span><strong>Your wallet is ready</strong><span>Complete a focus session or task to earn your first coins.</span></div>}</section>
             </motion.section>
           ) : view === "statistics" ? (
@@ -605,6 +662,31 @@ export default function Dashboard() {
       <nav className="mobile-nav" aria-label="Mobile navigation">
         {nav.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? "mobile-active" : ""} onClick={() => setView(id)}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></button>)}
       </nav>
+      <Dialog open={pairingSetupOpen} onOpenChange={(open) => { if (!pairingBusy) setPairingSetupOpen(open); }}>
+        <DialogContent className="reward-confirm-dialog">
+          <DialogHeader>
+            <DialogTitle>Set your YouTube rates</DialogTitle>
+            <DialogDescription>These rates are saved to your Focus Rewards account and determine server-calculated charges for new purchases. Prices are rounded up to the next whole Coin.</DialogDescription>
+          </DialogHeader>
+          {pairingCode ? (
+            <div className="extension-pairing-code pairing-code-dialog-result">
+              <code aria-label="Single-use extension pairing code">{pairingCode.code}</code>
+              <span>Single use · expires {new Date(pairingCode.expiresAt).toLocaleTimeString("de-DE")}</span>
+              <button type="button" onClick={() => void copyPairingCode()}>{pairingCodeCopied ? "Copied" : "Copy code"}</button>
+            </div>
+          ) : (
+            <form className="youtube-rate-form" onSubmit={(event) => void createPairingCode(event)}>
+              <div className="youtube-rate-field"><Label htmlFor="standard-youtube-rate">Standard videos</Label><div><Input id="standard-youtube-rate" type="number" min="0.01" max="100" step="0.01" required value={standardRateInput} onChange={(event) => setStandardRateInput(event.target.value)} /><span>Coins / min</span></div></div>
+              <div className="youtube-rate-field"><Label htmlFor="shorts-youtube-rate">YouTube Shorts</Label><div><Input id="shorts-youtube-rate" type="number" min="0.01" max="100" step="0.01" required value={shortsRateInput} onChange={(event) => setShortsRateInput(event.target.value)} /><span>Coins / min</span></div></div>
+              <div className="youtube-rate-field youtube-rate-disabled"><Label htmlFor="flexible-youtube-rate">Flexible usage</Label><div><Input id="flexible-youtube-rate" type="number" min="0.01" max="100" step="0.01" required value={flexibleRateInput} onChange={(event) => setFlexibleRateInput(event.target.value)} /><span>Coins / min</span></div><small>Rate saved for later. Flexible billing stays disabled until progressive settlement, session recovery, and insufficient-balance safeguards are implemented and tested.</small></div>
+              <DialogFooter>
+                <button type="button" className="migration-secondary" disabled={pairingBusy} onClick={() => setPairingSetupOpen(false)}>Cancel</button>
+                <button type="submit" disabled={pairingBusy}>{pairingBusy ? "Saving rates…" : "Save rates and create code"}</button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
       <AlertDialog open={pendingTaskAction !== null} onOpenChange={(open) => { if (!open) setPendingTaskAction(null); }}>
         <AlertDialogContent className="reward-confirm-dialog">
           <AlertDialogHeader>

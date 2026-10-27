@@ -17,17 +17,54 @@ All relevant files live in the 'src' directory.
 
 Use bun for the package manager.
 
-## Setup
+## Local development and environment variables
 
-This project is set up already and running on a cloud environment, as well as a convex development in the sandbox.
+Use Bun with the checked-in `bun.lock`:
 
-## Environment Variables
+```sh
+bun install --frozen-lockfile
+bun run dev
+```
 
-The project is set up with project specific CONVEX_DEPLOYMENT and VITE_CONVEX_URL environment variables on the client side.
+Set the following through the local Convex CLI/dashboard for the intended development deployment:
 
-The convex server has a separate set of environment variables that are accessible by the convex backend.
+- `CONVEX_DEPLOYMENT` is the local Convex CLI deployment selector (for example, `dev:useful-firefly-508`); it is not a browser credential. `VITE_CONVEX_URL` is the public client URL used by the website to connect to Convex. Do not put secrets in any `VITE_` variable.
+- `CONVEX_SITE_URL` is the Convex HTTP Actions URL used by Convex Auth; keep it in the Convex deployment's configuration.
+- `AUTH_RESEND_KEY` is a private Resend API key, and `AUTH_EMAIL_FROM` is the verified sender address. Configure these as Convex server environment variables. Never use a `VITE_` prefix for credentials.
+- Convex Auth signing configuration such as `JWT_PRIVATE_KEY` and `JWKS` is managed by the Convex deployment; do not copy private key material into frontend or extension files.
+- `BETA_REQUIRE_APPROVAL`, `BETA_INVITATIONS_ENABLED`, and `BETA_ADMIN_EMAIL` are server-only beta policy configuration. Per-user YouTube pricing rates are validated and stored on the Convex user record; they are not supplied by environment variables or trusted from extension requests.
 
-Currently, these variables include auth-specific keys: JWKS, JWT_PRIVATE_KEY, and SITE_URL.
+Use `.env.example` as a name-only template. Do not commit `.env`, `.env.local`, deployment credentials, Resend keys, JWT private keys, or other secret values. The development and production Convex deployments have separate configuration and data; configure and verify each intentionally. Local Convex code generation writes local generated types and does not upload functions. `convex dev` uploads functions to the selected development deployment; do not use it as a substitute for code generation when upload is not intended. Production deployment is a separate, explicit operation.
+
+## Browser extension (Opera GX and Chrome)
+
+The extension is a Manifest V3 unpacked extension. To try the current local build:
+
+1. In Chrome, open `chrome://extensions`; in Opera GX, open `opera://extensions`.
+2. Enable **Developer mode**.
+3. Choose **Load unpacked** and select this repository's `extension/` directory.
+4. After editing extension files, use the extension card's **Reload** control and reload the YouTube tab.
+
+For a distributable release, first package/review only the `extension/` directory and install through the appropriate browser store or extension-management policy. No extension store release is performed by these local steps.
+
+### Pairing and session lifetime
+
+Sign in to the website using the existing email OTP or guest flow, obtain beta approval as required, and complete profile setup. In Dashboard → Wallet, create an extension pairing code and enter the code and the corresponding HTTPS `*.convex.site` URL in the extension options. Pairing codes are single-use and expire after five minutes. The extension receives a dedicated random bearer credential; it persists in Chrome/Opera extension local storage across service-worker restarts and is restricted to trusted extension contexts. The backend validates the session on requests and enforces its maximum 30-day expiration, server-side revocation, beta approval and completed profile. Use **Abmelden und Erweiterungssitzung widerrufen** to revoke it. A transient network error retains the credential so it can be checked again; a confirmed 401 or local expiry clears it. Extension credentials are never placed in a URL, website local storage, or page-readable storage.
+
+### YouTube purchases and unlocks
+
+On supported YouTube watch and Shorts pages, the extension displays an estimate/interface only. Each account can set separate standard-video and Shorts rates (defaulting to 1.2 and 1.4 Coins per minute); the server validates and stores those rates and creates a short-lived price quote. A purchase is charged from that server quote, not from a client-supplied price, and the backend atomically records the debit, transaction, idempotency key and 30-day entitlement. Flexible usage has a configurable saved rate but remains disabled. The UI reports an unlock only after server confirmation and checks entitlements with the server. Client storage or a prior success message is not proof of entitlement. The overlay is only a deterrence/interface feature: it does not control or bypass YouTube playback and cannot prevent access by other means. Changes in YouTube's DOM/layout may require extension updates.
+
+### Tests and checks
+
+```sh
+node --test extension/tests/*.test.js
+bunx vitest run src/convex/access.test.ts src/convex/extension.test.ts
+bunx eslint extension/src/content.js extension/src/service-worker.js extension/options/options.js extension/popup/popup.js extension/tests/*.test.js
+bun run build
+```
+
+To regenerate Convex types locally without uploading functions, confirm the existing development deployment, then run `CONVEX_DEPLOYMENT=dev:useful-firefly-508 bunx convex codegen`; generated code is ignored by Git in this repository. Code generation requires Convex CLI authentication in the shell running it. `bunx convex dev` is not a code-generation-only command and uploads functions to the selected development deployment. Never select production for local verification. Tests use simulated browser APIs/Convex test contexts and do not prove real browser lifecycle behavior, real OTP email delivery, or a live deployment integration.
 
 
 # Using Authentication (Important!)

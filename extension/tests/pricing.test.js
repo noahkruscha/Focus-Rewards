@@ -8,26 +8,28 @@ const context = vm.createContext({});
 vm.runInContext(source, context);
 const pricing = context.FocusRewardsPricing;
 
-test("prices duration in seconds with the central multiplier and rounds up", () => {
+test("prices duration using the supplied standard or Shorts server rate and rounds up", () => {
   const examples = [
-    [5, 6],
-    [10, 12],
-    [15, 18],
-    [20, 24],
-    [30, 36],
-    [45, 54],
-    [60, 72],
+    [5, 1.2, 6],
+    [10, 1.2, 12],
+    [15, 1.2, 18],
+    [20, 1.2, 24],
+    [5, 1.4, 7],
+    [5, 1.6, 8],
   ];
-  for (const [minutes, expected] of examples) {
-    assert.equal(pricing.priceForDurationSeconds(minutes * 60), expected);
+  for (const [minutes, rate, expected] of examples) {
+    assert.equal(pricing.priceForDurationSeconds(minutes * 60, rate), expected);
   }
-  assert.equal(pricing.priceForDurationSeconds(1), 1);
-  assert.equal(pricing.priceForDurationSeconds(61), 2);
+  assert.equal(pricing.priceForDurationSeconds(1, 1.2), 1);
+  assert.equal(pricing.priceForDurationSeconds(61, 1.2), 2);
 });
 
 test("does not price missing, invalid, or non-positive durations", () => {
   for (const duration of [null, undefined, NaN, Infinity, 0, -30, "300"]) {
     assert.equal(pricing.priceForDurationSeconds(duration), null);
+  }
+  for (const rate of [null, NaN, Infinity, 0, -1, 100.01]) {
+    assert.equal(pricing.priceForDurationSeconds(60, rate), null);
   }
 });
 

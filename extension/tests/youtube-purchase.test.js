@@ -49,13 +49,14 @@ test("purchase omits client prices and preserves idempotency key after a network
     return jsonResponse({ success: true, price: 36, expiresAt: Date.now() + 30 * 86400000, alreadyProcessed: true });
   } });
   const request = {
-    type: "youtube-purchase", videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900,
-    idempotencyKey: "stable-idempotency-key-01", price: 1,
+    type: "youtube-purchase",    videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900,
+    idempotencyKey: "stable-idempotency-key-01", quoteId: "quote-from-server", price: 1,
   };
   assert.equal((await worker.send(request)).kind, "network");
   assert.equal((await worker.send(request)).alreadyProcessed, true);
   assert.equal(calls.length, 2);
   assert.equal(JSON.parse(calls[1].init.body).price, undefined);
+  assert.equal(JSON.parse(calls[1].init.body).quoteId, request.quoteId);
   assert.equal(JSON.parse(calls[1].init.body).idempotencyKey, request.idempotencyKey);
   assert.equal(calls[1].init.headers.Authorization, `Bearer ${"T".repeat(43)}`);
 });

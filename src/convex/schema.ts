@@ -26,6 +26,11 @@ const schema = defineSchema(
       name: v.optional(v.string()), // auth-provided name; legacy field retained
       displayName: v.optional(v.string()), // onboarding name, independent from auth identity
       onboardingCompletedAt: v.optional(v.number()),
+      youtubePricingRates: v.optional(v.object({
+        standardCoinsPerMinute: v.number(),
+        shortsCoinsPerMinute: v.number(),
+        flexibleCoinsPerMinute: v.number(),
+      })),
       image: v.optional(v.string()), // image of the user. do not remove
       email: v.optional(v.string()), // email of the user. do not remove
       emailVerificationTime: v.optional(v.number()), // email verification time. do not remove
@@ -98,6 +103,7 @@ const schema = defineSchema(
       contentId: v.optional(v.string()),
       durationSeconds: v.optional(v.number()),
       entitlementDays: v.optional(v.number()),
+      youtubeRateCoinsPerMinute: v.optional(v.number()),
       transactionId: v.optional(v.id("walletTransactions")),
       expiresAt: v.optional(v.number()),
       revokedAt: v.optional(v.number()),
@@ -146,6 +152,20 @@ const schema = defineSchema(
       expiresAt: v.number(),
       revokedAt: v.optional(v.number()),
     }).index("by_hash", ["tokenHash"]).index("by_user", ["userId"]),
+
+    youtubePurchaseQuotes: defineTable({
+      userId: v.id("users"),
+      videoId: v.string(),
+      contentType: v.union(v.literal("youtube_video"), v.literal("youtube_short")),
+      durationSeconds: v.number(),
+      rateCoinsPerMinute: v.number(),
+      price: v.number(),
+      createdAt: v.number(),
+      expiresAt: v.number(),
+      redeemedAt: v.optional(v.number()),
+      idempotencyKey: v.optional(v.string()),
+    }).index("by_user", ["userId"]).index("by_expiry", ["expiresAt"]),
+
   },
   {
     schemaValidation: false,

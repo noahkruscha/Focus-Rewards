@@ -2,8 +2,12 @@
   "manifest_version": 3,
   "name": "Focus Rewards — YouTube Estimates",
   "version": "1.0.0",
-  "description": "See an estimated Focus Rewards coin value on regular YouTube video recommendations.",
+  "description": "See Focus Rewards estimates on YouTube and manage your linked account.",
   "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Focus Rewards"
+  },
   "web_accessible_resources": [
     {
       "resources": ["options/options.html"],
