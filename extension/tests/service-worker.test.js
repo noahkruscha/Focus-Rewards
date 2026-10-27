@@ -183,6 +183,57 @@ test("pricing rates are read from the authenticated server and flexible usage st
   assert.equal(request.init.headers.Authorization, `Bearer ${"T".repeat(43)}`);
 });
 
+test("standard video purchase retries reuse the saved transaction key after a lost response", async () => {
+  const stored = {
+    focusRewardsExtensionToken: "T".repeat(43),
+    focusRewardsExtensionExpiresAt: Date.now() + 60_000,
+    focusRewardsConvexSiteUrl: "https://focus.convex.site",
+  };
+  const keys = [];
+  let statusCode = 503;
+  const worker = makeWorker({ stored, fetchImpl: async (_url, init) => {
+    const body = JSON.parse(init.body);
+    keys.push(body.idempotencyKey);
+    return statusCode === 200 ? response({ success: true, price: 6, expiresAt: Date.now() + 18 * 60 * 60 * 1000 }) : response({ error: "unknown" }, statusCode);
+  } });
+  const sender = { id: worker.chrome.runtime.id, url: "https://www.youtube.com/watch?v=abcdefghijk", tab: { id: 1 } };
+  const request = { type: "youtube-purchase", videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 300, idempotencyKey: "video-key-00000001", quoteId: "quote-id" };
+  const first = await worker.message(request, sender);
+  assert.equal(first.kind, "network");
+  assert.equal(stored.focusRewardsPendingVideoPurchase.idempotencyKey, "video-key-00000001");
+  statusCode = 200;
+  assert.equal((await worker.message({ ...request, idempotencyKey: "video-key-00000002" }, sender)).ok, true);
+  assert.deepEqual(keys, ["video-key-00000001", "video-key-00000001"]);
+  assert.equal(stored.focusRewardsPendingVideoPurchase, undefined);
+});
+
+test("Shorts purchase retries reuse the same durable idempotency key until the server confirms the result", async () => {
+  const stored = {
+    focusRewardsExtensionToken: "T".repeat(43),
+    focusRewardsExtensionExpiresAt: Date.now() + 60_000,
+    focusRewardsConvexSiteUrl: "https://focus.convex.site",
+  };
+  const keys = [];
+  let statusCode = 503;
+  const worker = makeWorker({ stored, fetchImpl: async (_url, init) => {
+    const body = JSON.parse(init.body);
+    keys.push(body.idempotencyKey);
+    return statusCode === 200 ? response({ success: true, price: 7, expiresAt: Date.now() + 300_000 }) : response({ error: "unknown" }, statusCode);
+  } });
+  const sender = { id: worker.chrome.runtime.id, url: "https://www.youtube.com/shorts/abcdefghijk", tab: { id: 1 } };
+  const first = await worker.message({ type: "youtube-shorts-time", minutes: 5, idempotencyKey: "caller-key-00000001" }, sender);
+  assert.equal(first.kind, "network");
+  const pending = stored.focusRewardsPendingShortsPurchase;
+  assert.equal(pending.idempotencyKey, "caller-key-00000001");
+  const different = await worker.message({ type: "youtube-shorts-time", minutes: 10, idempotencyKey: "caller-key-00000002" }, sender);
+  assert.equal(different.kind, "pending-purchase");
+  statusCode = 200;
+  const retry = await worker.message({ type: "youtube-shorts-time", minutes: 5, idempotencyKey: "caller-key-00000003" }, sender);
+  assert.equal(retry.ok, true);
+  assert.equal(keys[0], keys[1]);
+  assert.equal(stored.focusRewardsPendingShortsPurchase, undefined);
+});
+
 test("pairing URL and code validation reject insecure or attacker-controlled endpoints", async () => {
   const worker = makeWorker({ fetchImpl: async () => { throw new Error("unexpected fetch"); } });
   assert.equal((await worker.message({ type: "pair", siteUrl: "http://focus.convex.site", code: "c".repeat(32) })).kind, "input");

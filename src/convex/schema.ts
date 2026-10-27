@@ -26,6 +26,8 @@ const schema = defineSchema(
       name: v.optional(v.string()), // auth-provided name; legacy field retained
       displayName: v.optional(v.string()), // onboarding name, independent from auth identity
       onboardingCompletedAt: v.optional(v.number()),
+      deactivatedAt: v.optional(v.number()),
+      deactivatedBy: v.optional(v.id("users")),
       youtubePricingRates: v.optional(v.object({
         standardCoinsPerMinute: v.number(),
         shortsCoinsPerMinute: v.number(),
@@ -103,6 +105,7 @@ const schema = defineSchema(
       contentId: v.optional(v.string()),
       durationSeconds: v.optional(v.number()),
       entitlementDays: v.optional(v.number()),
+      entitlementHours: v.optional(v.number()),
       youtubeRateCoinsPerMinute: v.optional(v.number()),
       transactionId: v.optional(v.id("walletTransactions")),
       expiresAt: v.optional(v.number()),
@@ -152,6 +155,21 @@ const schema = defineSchema(
       expiresAt: v.number(),
       revokedAt: v.optional(v.number()),
     }).index("by_hash", ["tokenHash"]).index("by_user", ["userId"]),
+
+    shortsAccessSessions: defineTable({
+      userId: v.id("users"),
+      expiresAt: v.number(),
+      updatedAt: v.number(),
+    }).index("by_user", ["userId"]),
+
+    shortsAccessGrants: defineTable({
+      userId: v.id("users"),
+      idempotencyKey: v.string(),
+      minutes: v.number(),
+      cost: v.number(),
+      expiresAt: v.number(),
+      createdAt: v.number(),
+    }).index("by_user_idempotency", ["userId", "idempotencyKey"]),
 
     youtubePurchaseQuotes: defineTable({
       userId: v.id("users"),

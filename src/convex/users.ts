@@ -22,7 +22,7 @@ export const currentUser = query({
     const userId = await getAuthUserId(ctx);
     if (userId === null) return null;
     const user = await ctx.db.get(userId);
-    if (!user) return null;
+    if (!user || user.deactivatedAt !== undefined) return null;
     const approvalRequired = process.env.BETA_REQUIRE_APPROVAL !== "false";
     const profileAlreadyExists = validDisplayName(user.displayName) || validDisplayName(user.name);
     let access: { status: "pending" | "approved" | "revoked" } | null = null;
@@ -44,7 +44,7 @@ export const completeOnboarding = mutation({
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new ConvexError("Sign in to continue.");
     const user = await ctx.db.get(userId);
-    if (!user) throw new ConvexError("Account not found.");
+    if (!user || user.deactivatedAt !== undefined) throw new ConvexError("Account unavailable.");
     const approvalRequired = process.env.BETA_REQUIRE_APPROVAL !== "false";
     if (approvalRequired) {
       const access = await accessFor(ctx, userId);

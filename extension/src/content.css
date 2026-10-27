@@ -58,6 +58,77 @@
 .fr-youtube-purchase button:disabled { cursor: wait; opacity: .62; }
 .fr-youtube-purchase button[hidden] { display: none; }
 .fr-youtube-message { grid-column: 1; color: var(--fr-muted); font-size: 11px; line-height: 1.5; }
+.fr-youtube-video-title, .fr-youtube-duration { color: var(--fr-muted); font-size: 13px; overflow-wrap: anywhere; }
+.fr-youtube-cancel { border-color: rgba(235,242,238,.18) !important; background: rgba(23,27,28,.82) !important; color: var(--fr-ink) !important; }
+.fr-youtube-purchase .fr-youtube-cancel { border-color: rgba(235,242,238,.18) !important; background: rgba(23,27,28,.82) !important; color: var(--fr-ink) !important; }
+
+.fr-youtube-blocked ytd-watch-flexy #player,
+.fr-youtube-blocked ytd-watch-flexy video.html5-main-video,
+.fr-youtube-blocked ytd-watch-flexy #below,
+.fr-youtube-blocked ytd-watch-flexy #secondary,
+.fr-youtube-blocked ytd-shorts,
+.fr-youtube-blocked ytd-reel-video-renderer,
+.fr-youtube-blocked video.html5-main-video {
+  filter: blur(12px) brightness(.32) !important;
+  pointer-events: none !important;
+  user-select: none !important;
+}
+
+.fr-youtube-purchase[role="dialog"] {
+  position: fixed !important;
+  z-index: 999999 !important;
+  top: 50vh !important;
+  left: 50vw !important;
+  transform: translate(-50%, -50%) !important;
+  width: min(520px, calc(100vw - 32px)) !important;
+  max-height: min(80vh, 680px) !important;
+  overflow: auto !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+  padding: 24px !important;
+  border-color: rgba(151,224,187,.34) !important;
+  background: rgba(14,18,19,.97) !important;
+  box-shadow: 0 28px 100px rgba(0,0,0,.66) !important;
+}
+
+.fr-youtube-purchase[role="dialog"] button { grid-column: 1 !important; grid-row: auto !important; max-width: 100% !important; }
+.fr-shorts-options { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
+.fr-shorts-options > span { grid-column: 1 / -1; color: var(--fr-muted); font-size: 12px; }
+.fr-youtube-balance, .fr-youtube-brand {
+  display: inline-flex !important;
+  min-height: 36px !important;
+  align-items: center !important;
+  justify-content: center !important;
+  margin: 0 8px !important;
+  padding: 0 12px !important;
+  border: 1px solid rgba(151,224,187,.25) !important;
+  border-radius: 999px !important;
+  background: rgba(20,24,25,.88) !important;
+  color: #c9f2dc !important;
+  font: 600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;
+  white-space: nowrap !important;
+  cursor: pointer !important;
+}
+.fr-youtube-brand { min-height: 30px !important; margin-inline: 10px !important; font-size: 11px !important; }
+.fr-youtube-balance[data-state="disconnected"], .fr-youtube-balance[data-state="loading"] { color: #c2cbc7 !important; }
+.fr-youtube-balance:focus-visible, .fr-youtube-brand:focus-visible, .fr-youtube-purchase button:focus-visible { outline: 2px solid #baf0d0 !important; outline-offset: 3px !important; }
+
+.fr-youtube-filtered-short { display: none !important; }
+.fr-youtube-reminder {
+  position: fixed !important;
+  z-index: 999998 !important;
+  top: 14px !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  max-width: calc(100vw - 24px) !important;
+  padding: 10px 16px !important;
+  border: 1px solid rgba(151,224,187,.32) !important;
+  border-radius: 12px !important;
+  background: rgba(14,18,19,.96) !important;
+  color: #c9f2dc !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,.5) !important;
+  font: 600 13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;
+  pointer-events: none !important;
+}
 
 .fr-youtube-price {
   display: inline-flex !important;
@@ -82,6 +153,11 @@
   background: rgba(232, 203, 141, .16) !important;
 }
 
+@media (max-width: 760px) {
+  .fr-youtube-brand { display: none !important; }
+  .fr-youtube-balance { padding-inline: 8px !important; margin-inline: 4px !important; }
+}
+
 @media (max-width: 600px) {
   .fr-youtube-purchase {
     width: calc(100% - 16px);
@@ -92,6 +168,8 @@
   }
 
   .fr-youtube-purchase button { max-width: 44vw; padding: 8px 10px; }
+  .fr-youtube-purchase[role="dialog"] { padding: 18px !important; }
+  .fr-shorts-options { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

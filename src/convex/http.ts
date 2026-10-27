@@ -10,7 +10,7 @@ auth.addHttpRoutes(http);
 
 const extensionCors = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Max-Age": "600",
 };
@@ -85,6 +85,29 @@ http.route({
       }
       console.error("[extension:redeem] Unexpected backend failure.");
       return jsonResponse({ error: "Pairing service is temporarily unavailable." }, 503);
+    }
+  }),
+});
+
+http.route({
+  path: "/extension/youtube/balance",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+
+http.route({
+  path: "/extension/youtube/balance",
+  method: "GET",
+  handler: httpAction(async (ctx, request) => {
+    const authenticated = await authenticatedExtensionSession(ctx, request);
+    if ("error" in authenticated) return authenticated.error;
+    try {
+      const balance = await ctx.runQuery(internal.rewards.extensionYouTubeBalance, { tokenHash: authenticated.session.tokenHash, now: Date.now() });
+      return jsonResponse({ ...balance, serverTime: Date.now() });
+    } catch (error) {
+      if (error instanceof ConvexError) return jsonResponse({ error: error.message }, 401);
+      console.error("[extension:youtube-balance] Unexpected backend failure.");
+      return jsonResponse({ error: "Balance is temporarily unavailable." }, 503);
     }
   }),
 });
@@ -167,6 +190,34 @@ http.route({
   handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
 });
 
+http.route({
+  path: "/extension/youtube/pricing-rates",
+  method: "PUT",
+  handler: httpAction(async (ctx, request) => {
+    if (!isAllowedExtensionOrigin(request)) return jsonResponse({ error: "Origin not allowed." }, 403);
+    if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) return jsonResponse({ error: "Expected JSON." }, 415);
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonResponse({ error: "Invalid JSON." }, 400); }
+    if (typeof body !== "object" || body === null || !("standardCoinsPerMinute" in body) || typeof body.standardCoinsPerMinute !== "number" || !("shortsCoinsPerMinute" in body) || typeof body.shortsCoinsPerMinute !== "number" || !("expectedStandard" in body) || typeof body.expectedStandard !== "number" || !("expectedShorts" in body) || typeof body.expectedShorts !== "number") return jsonResponse({ error: "Invalid pricing settings." }, 400);
+    const authenticated = await authenticatedExtensionSession(ctx, request);
+    if ("error" in authenticated) return authenticated.error;
+    try {
+      const rates = await ctx.runMutation(internal.rewards.setExtensionYouTubePricingRates, { tokenHash: authenticated.session.tokenHash, expectedStandard: body.expectedStandard, expectedShorts: body.expectedShorts, standardCoinsPerMinute: body.standardCoinsPerMinute, shortsCoinsPerMinute: body.shortsCoinsPerMinute, now: Date.now() });
+      return jsonResponse({ ...rates, flexibleUsageEnabled: false });
+    } catch (error) {
+      if (error instanceof ConvexError) return jsonResponse({ error: error.message }, error.message.startsWith("Extension session") ? 401 : 409);
+      console.error("[extension:youtube-pricing-save] Unexpected backend failure.");
+      return jsonResponse({ error: "Pricing settings could not be saved." }, 503);
+    }
+  }),
+});
+
+http.route({
+  path: "/extension/youtube/shorts-time",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+
 async function authenticatedExtensionSession(ctx: Parameters<Parameters<typeof httpAction>[0]>[0], request: Request): Promise<
   | { session: { userId: import("./_generated/dataModel").Id<"users">; tokenHash: string; email: string | null; expiresAt: number } }
   | { error: Response }
@@ -224,6 +275,35 @@ http.route({
 });
 
 http.route({
+  path: "/extension/youtube/shorts-time",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (!isAllowedExtensionOrigin(request)) return jsonResponse({ error: "Origin not allowed." }, 403);
+    if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) return jsonResponse({ error: "Expected JSON." }, 415);
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonResponse({ error: "Invalid JSON." }, 400); }
+    if (typeof body !== "object" || body === null || !("minutes" in body) || typeof body.minutes !== "number" || !("idempotencyKey" in body) || typeof body.idempotencyKey !== "string") {
+      return jsonResponse({ error: "Invalid Shorts access request." }, 400);
+    }
+    const authenticated = await authenticatedExtensionSession(ctx, request);
+    if ("error" in authenticated) return authenticated.error;
+    try {
+      return jsonResponse(await ctx.runMutation(internal.rewards.purchaseShortsTime, {
+        tokenHash: authenticated.session.tokenHash, minutes: body.minutes, idempotencyKey: body.idempotencyKey, now: Date.now(),
+      }));
+    } catch (error) {
+      if (error instanceof ConvexError) {
+        if (error.message === "INSUFFICIENT_COINS") return jsonResponse({ error: "INSUFFICIENT_COINS" }, 402);
+        if (error.message.startsWith("Extension session")) return jsonResponse({ error: error.message }, 401);
+        return jsonResponse({ error: error.message }, 400);
+      }
+      console.error("[extension:youtube-shorts-time] Unexpected backend failure.");
+      return jsonResponse({ error: "Shorts access is temporarily unavailable." }, 503);
+    }
+  }),
+});
+
+http.route({
   path: "/extension/youtube/entitlement",
   method: "GET",
   handler: httpAction(async (ctx, request) => {
@@ -241,7 +321,9 @@ http.route({
       contentType,
       now: Date.now(),
     });
-    return entitlement ? jsonResponse({ unlocked: true, ...entitlement }) : jsonResponse({ unlocked: false });
+    return entitlement
+      ? jsonResponse({ unlocked: true, ...entitlement, serverTime: Date.now() })
+      : jsonResponse({ unlocked: false, serverTime: Date.now() });
   }),
 });
 

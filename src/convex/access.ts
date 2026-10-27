@@ -61,18 +61,20 @@ function hasCompletedProfile(user: { displayName?: string; name?: string } | nul
 
 export async function requireApprovedUser(ctx: QueryCtx | MutationCtx) {
   const userId = await signedInUserId(ctx);
+  const user = await ctx.db.get(userId);
+  if (!user || user.deactivatedAt !== undefined) throw new ConvexError(ACCESS_DENIED);
   if (approvalRequired()) {
     const access = await accessFor(ctx, userId);
     if (!access || access.status !== "approved") throw new ConvexError(ACCESS_DENIED);
   }
-  if (!hasCompletedProfile(await ctx.db.get(userId))) throw new ConvexError("Complete your profile setup to continue.");
+  if (!hasCompletedProfile(user)) throw new ConvexError("Complete your profile setup to continue.");
   return userId;
 }
 
 export async function requireAdministrator(ctx: QueryCtx | MutationCtx) {
   const userId = await signedInUserId(ctx);
   const user = await ctx.db.get(userId);
-  if (!user || user.role !== "admin") throw new ConvexError("Administrator access required.");
+  if (!user || user.role !== "admin" || user.deactivatedAt !== undefined) throw new ConvexError("Administrator access required.");
   if (approvalRequired()) {
     const access = await accessFor(ctx, userId);
     if (access?.status !== "approved") throw new ConvexError(ACCESS_DENIED);
@@ -133,6 +135,7 @@ export const status = query({
     const userId = await getAuthUserId(ctx);
     if (userId === null) return { authenticated: false, approved: false, guestAccount: false, onboardingComplete: false, requesterName: null, administrator: false, canClaimInitialAdministrator: false, approvalRequired: approvalRequired() };
     const user = await ctx.db.get(userId);
+    if (!user || user.deactivatedAt !== undefined) return { authenticated: false, approved: false, guestAccount: false, onboardingComplete: false, requesterName: null, administrator: false, canClaimInitialAdministrator: false, approvalRequired: approvalRequired() };
     const access = await accessFor(ctx, userId);
     const approved = !approvalRequired() || access?.status === "approved";
     const configuredAdminEmail = process.env.BETA_ADMIN_EMAIL?.trim().toLowerCase();
@@ -142,11 +145,11 @@ export const status = query({
     );
     return {
       authenticated: true,
-      approved,
+      approved: approved && user?.deactivatedAt === undefined,
       guestAccount: user?.isAnonymous === true,
       onboardingComplete: hasCompletedProfile(user),
       requesterName: access?.requesterName && validRequesterName(access.requesterName) ? access.requesterName.trim() : null,
-      administrator: approved && user?.role === "admin",
+      administrator: approved && user?.deactivatedAt === undefined && user?.role === "admin",
       canClaimInitialAdministrator,
       approvalRequired: approvalRequired(),
       status: access?.status ?? "pending",
@@ -195,7 +198,8 @@ export const registerGuestRecoveryCredential = mutation({
   handler: async (ctx, args) => {
     const userId = await signedInUserId(ctx);
     const user = await ctx.db.get(userId);
-    if (!user?.isAnonymous) throw new ConvexError("Guest account recovery can only be enabled for the signed-in guest account.");
+    if (!user || user.deactivatedAt !== undefined) throw new ConvexError("Account unavailable.");
+    if (!user.isAnonymous) throw new ConvexError("Guest account recovery can only be enabled for the signed-in guest account.");
     if (!/^[A-Za-z0-9_-]{43}$/.test(args.credential)) throw new ConvexError("Invalid guest recovery credential.");
     const providerAccountId = await hashGuestRecoveryCredential(args.credential);
     const matchingCredential = await ctx.db.query("authAccounts")
@@ -220,7 +224,7 @@ export const requestApproval = mutation({
     const userId = await signedInUserId(ctx);
     if (!validRequesterName(args.requesterName)) throw new ConvexError("Enter a name between 1 and 40 characters without control characters.");
     const user = await ctx.db.get(userId);
-    if (!user) throw new ConvexError("Account not found.");
+    if (!user || user.deactivatedAt !== undefined) throw new ConvexError("Account unavailable.");
     const existing = await accessFor(ctx, userId);
     if (existing?.status === "approved") return { approved: true };
     if (existing?.status === "revoked") throw new ConvexError("Your access was revoked. Contact the administrator.");
@@ -318,7 +322,7 @@ export const redeemExtensionPairingCode = internalMutation({
     }
     const user = await ctx.db.get(pairing.userId);
     const access = await accessFor(ctx, pairing.userId);
-    if (!user || user.isAnonymous || (approvalRequired() && access?.status !== "approved")) {
+    if (!user || user.isAnonymous || user.deactivatedAt !== undefined || (approvalRequired() && access?.status !== "approved")) {
       throw new ConvexError(ACCESS_DENIED);
     }
     const expiresAt = args.now + EXTENSION_SESSION_LIFETIME_MS;
@@ -350,7 +354,7 @@ export const assertExtensionSession = internalQuery({
     if (!session || session.revokedAt !== undefined || session.expiresAt <= args.now) return null;
     const user = await ctx.db.get(session.userId);
     const access = await accessFor(ctx, session.userId);
-    if (!user || user.isAnonymous || (approvalRequired() && access?.status !== "approved")) return null;
+    if (!user || user.isAnonymous || user.deactivatedAt !== undefined || (approvalRequired() && access?.status !== "approved")) return null;
     return { userId: session.userId, tokenHash: args.tokenHash, email: user.email ?? null, expiresAt: session.expiresAt };
   },
 });
@@ -370,6 +374,42 @@ export const extensionSessions = query({
       expiresAt,
       revoked: revokedAt !== undefined,
     }));
+  },
+});
+
+export const extensionPairingCodes = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await requireApprovedUser(ctx);
+    const codes = await ctx.db.query("extensionPairingCodes").withIndex("by_user", (q) => q.eq("userId", userId)).collect();
+    return codes.map(({ _id, createdAt, expiresAt, usedAt, revokedAt }) => ({
+      id: _id, createdAt, expiresAt, used: usedAt !== undefined, revoked: revokedAt !== undefined,
+    }));
+  },
+});
+
+export const revokeExtensionPairingCode = mutation({
+  args: { codeId: v.id("extensionPairingCodes") },
+  handler: async (ctx, args) => {
+    const userId = await requireApprovedUser(ctx);
+    const code = await ctx.db.get(args.codeId);
+    if (!code || code.userId !== userId) throw new ConvexError("Pairing code not found.");
+    if (code.usedAt !== undefined) throw new ConvexError("A redeemed pairing code cannot be revoked.");
+    if (code.revokedAt === undefined) await ctx.db.patch(code._id, { revokedAt: Date.now() });
+  },
+});
+
+export const deleteExtensionPairingCode = mutation({
+  args: { codeId: v.id("extensionPairingCodes") },
+  handler: async (ctx, args) => {
+    const userId = await requireApprovedUser(ctx);
+    const code = await ctx.db.get(args.codeId);
+    if (!code || code.userId !== userId) throw new ConvexError("Pairing code not found.");
+    if (code.usedAt !== undefined) throw new ConvexError("A redeemed pairing code cannot be deleted.");
+    if (code.revokedAt === undefined && code.expiresAt > Date.now()) {
+      throw new ConvexError("Revoke this active pairing code before deleting it.");
+    }
+    await ctx.db.delete(code._id);
   },
 });
 
@@ -413,7 +453,7 @@ export const adminOverview = query({
           createdAt: user._creationTime,
           anonymous: user.isAnonymous ?? false,
           role: user.role ?? null,
-          status: access?.status ?? statusByUser.get(user._id) ?? "pending",
+          status: user.deactivatedAt !== undefined ? "deactivated" : access?.status ?? statusByUser.get(user._id) ?? "pending",
           invited: access?.invitationId !== undefined,
           requestedAt: access?.requestedAt ?? null,
           approvedAt: access?.approvedAt ?? null,
@@ -460,7 +500,7 @@ export const restoreUserAccess = mutation({
     if (!approvalRequired()) throw new ConvexError("Manual beta approval is disabled for this deployment.");
     const adminId = await requireAdministrator(ctx);
     const user = await ctx.db.get(args.userId);
-    if (!user || user.isAnonymous || !user.email || !user.emailVerificationTime) throw new ConvexError("A verified email account is required.");
+    if (!user || user.deactivatedAt !== undefined || user.isAnonymous || !user.email || !user.emailVerificationTime) throw new ConvexError("A verified email account is required.");
     const existing = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", args.userId)).unique();
     if (!existing || existing.status !== "revoked") throw new ConvexError("This account has no revoked access to restore.");
     const now = Date.now();
@@ -533,7 +573,7 @@ export const approveUser = mutation({
     if (!approvalRequired()) throw new ConvexError("Manual beta approval is disabled for this deployment.");
     const adminId = await requireAdministrator(ctx);
     const user = await ctx.db.get(args.userId);
-    if (!user) throw new ConvexError("User not found.");
+    if (!user || user.deactivatedAt !== undefined) throw new ConvexError("User not found or deactivated.");
     const existing = await accessFor(ctx, args.userId);
     const guestRequest = Boolean(user.isAnonymous && existing?.status === "pending" && existing.requesterName?.trim());
     if ((!user.email || !user.emailVerificationTime || user.isAnonymous) && !guestRequest) throw new ConvexError("Only verified email accounts or named guest requests can be approved.");
@@ -545,6 +585,41 @@ export const approveUser = mutation({
 });
 
 
+
+export const deactivateUser = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const adminId = await requireAdministrator(ctx);
+    if (args.userId === adminId) throw new ConvexError("You cannot deactivate your own administrator account.");
+    const user = await ctx.db.get(args.userId);
+    if (!user) throw new ConvexError("User not found.");
+    if (user.deactivatedAt !== undefined) return { alreadyDeactivated: true };
+    if (user.role === "admin") {
+      const activeAdministrators = (await ctx.db.query("users").collect()).filter((item) => item.role === "admin" && item.deactivatedAt === undefined);
+      if (activeAdministrators.length <= 1) throw new ConvexError("The last active administrator cannot be deactivated.");
+    }
+    const now = Date.now();
+    await ctx.db.patch(user._id, { deactivatedAt: now, deactivatedBy: adminId });
+    const access = await ctx.db.query("betaAccess").withIndex("by_user", (q) => q.eq("userId", user._id)).unique();
+    if (access && access.status !== "revoked") await ctx.db.patch(access._id, { status: "revoked", updatedAt: now, updatedBy: adminId });
+    for (const code of await ctx.db.query("extensionPairingCodes").withIndex("by_user", (q) => q.eq("userId", user._id)).collect()) {
+      if (code.usedAt === undefined && code.revokedAt === undefined) await ctx.db.patch(code._id, { revokedAt: now });
+    }
+    for (const session of await ctx.db.query("extensionSessions").withIndex("by_user", (q) => q.eq("userId", user._id)).collect()) {
+      if (session.revokedAt === undefined) await ctx.db.patch(session._id, { revokedAt: now });
+    }
+    if (user.email) {
+      const email = user.email.trim().toLowerCase();
+      for (const emailAccess of await ctx.db.query("betaAccess").withIndex("by_email", (q) => q.eq("email", email)).collect()) {
+        if (emailAccess.status !== "revoked") await ctx.db.patch(emailAccess._id, { status: "revoked", updatedAt: now, updatedBy: adminId });
+      }
+    }
+    for (const shorts of await ctx.db.query("shortsAccessSessions").withIndex("by_user", (q) => q.eq("userId", user._id)).collect()) {
+      await ctx.db.delete(shorts._id);
+    }
+    return { alreadyDeactivated: false };
+  },
+});
 
 export const revokeUser = mutation({
   args: { userId: v.id("users") },
@@ -633,6 +708,7 @@ export const _grantInitialAdministrator = mutation({
     if (process.env.BETA_ADMIN_EMAIL?.trim().toLowerCase() !== user.email.toLowerCase()) {
       throw new ConvexError("This account is not the configured initial administrator.");
     }
+    if (user.deactivatedAt !== undefined) throw new ConvexError("This account is deactivated.");
     if (user.role === "admin") throw new ConvexError("The initial administrator has already been configured.");
     if (user.role) throw new ConvexError("This account already has a conflicting role.");
     const existingAdministrator = await ctx.db.query("users").filter((q) => q.eq(q.field("role"), "admin")).first();

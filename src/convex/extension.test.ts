@@ -138,6 +138,67 @@ describe("extension credential backend", () => {
     expect(response.status).toBe(403);
   });
 
+  it("purchases Shorts time at the saved rate, extends active time, and settles atomically and idempotently", async () => {
+    const t = createTest();
+    const { userId, identity } = await createApprovedUser(t, "shorts@example.com");
+    await identity.mutation(api.rewards.initialize);
+    await identity.mutation(api.rewards.setYouTubePricingRates, { standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 2.5, flexibleCoinsPerMinute: 1.6 });
+    const now = Date.now();
+    const tokenHash = "c".repeat(64);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("extensionSessions", { tokenHash, userId, createdAt: now, expiresAt: now + 60_000 });
+      const account = await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+      await ctx.db.patch(account!._id, { coins: 100 });
+    });
+    const args = { tokenHash, minutes: 5, idempotencyKey: "short-time-key-0001", now };
+    const first = await identity.mutation(internal.rewards.purchaseShortsTime, args);
+    expect(first).toMatchObject({ success: true, price: 13, expiresAt: now + 5 * 60_000, alreadyProcessed: false });
+    const lowBalanceKey = "short-time-poor-0001";
+    await t.run(async (ctx) => {
+      const account = await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+      await ctx.db.patch(account!._id, { coins: 10 });
+    });
+    await expect(identity.mutation(internal.rewards.purchaseShortsTime, { ...args, minutes: 30, idempotencyKey: lowBalanceKey, now })).rejects.toThrow(/INSUFFICIENT_COINS/);
+    await t.run(async (ctx) => {
+      const account = await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+      await ctx.db.patch(account!._id, { coins: 87 });
+    });
+    const second = await identity.mutation(internal.rewards.purchaseShortsTime, { ...args, minutes: 10, idempotencyKey: "short-time-key-0002", now: now + 1000 });
+    expect(second.expiresAt).toBe(first.expiresAt + 10 * 60_000);
+    const retry = await identity.mutation(internal.rewards.purchaseShortsTime, args);
+    expect(retry).toMatchObject({ success: true, price: 13, expiresAt: first.expiresAt, alreadyProcessed: true });
+    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_short", now: second.expiresAt })).toBeNull();
+    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_short", now: now + 2 })).toMatchObject({ expiresAt: second.expiresAt });
+    expect(await identity.query(api.rewards.snapshot)).toMatchObject({ coins: 62 });
+    await expect(identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_short", durationSeconds: 30, now })).rejects.toThrow(/purchased by time/);
+  });
+
+  it("serves authenticated current balances and protects the popup rate editor from conflicts", async () => {
+    const t = createTest();
+    const { userId, identity } = await createApprovedUser(t, "popup@example.com");
+    await identity.mutation(api.rewards.initialize);
+    const now = Date.now();
+    const token = "popup-extension-token-000000000000000000000000000000000000";
+    const tokenHash = await hash("extension-session", token);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("extensionSessions", { tokenHash, userId, createdAt: now, expiresAt: now + 60_000 });
+      const account = await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+      await ctx.db.patch(account!._id, { coins: 42 });
+    });
+    const auth = { Authorization: `Bearer ${token}` };
+    const balance = await t.fetch("/extension/youtube/balance", { headers: auth });
+    expect(await balance.json()).toMatchObject({ coins: 42, shortsExpiresAt: null });
+    const original = await t.fetch("/extension/youtube/pricing-rates", { headers: auth });
+    expect(original.status).toBe(200);
+    const saved = await t.fetch("/extension/youtube/pricing-rates", { method: "PUT", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ standardCoinsPerMinute: 2.2, shortsCoinsPerMinute: 3.4, expectedStandard: 1.2, expectedShorts: 1.4 }) });
+    expect(saved.status).toBe(200);
+    const conflict = await t.fetch("/extension/youtube/pricing-rates", { method: "PUT", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ standardCoinsPerMinute: 1, shortsCoinsPerMinute: 1, expectedStandard: 1.2, expectedShorts: 1.4 }) });
+    expect(conflict.status).toBe(409);
+    const forged = await t.fetch("/extension/youtube/pricing-rates", { method: "PUT", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ standardCoinsPerMinute: 0, shortsCoinsPerMinute: 1000, expectedStandard: 2.2, expectedShorts: 3.4 }) });
+    expect(forged.status).toBe(409);
+    expect(await identity.query(api.rewards.youtubePricingRates)).toMatchObject({ standardCoinsPerMinute: 2.2, shortsCoinsPerMinute: 3.4 });
+  });
+
   it("charges the user's saved standard rate atomically and records the applied rate on the entitlement", async () => {
     const t = createTest();
     const { userId, identity } = await createApprovedUser(t, "buyer@example.com");
@@ -163,8 +224,8 @@ describe("extension credential backend", () => {
     expect(state.purchases).toHaveLength(1);
     expect(state.purchases[0]).toMatchObject({ contentType: "youtube_video", contentId: "abcdefghijk", durationSeconds: 900, youtubeRateCoinsPerMinute: 2, cost: 30, transactionId: state.transactions[0]._id });
     expect(state.transactions).toHaveLength(1);
-    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", now })).toMatchObject({ durationSeconds: 900 });
-    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", now: now + 31 * 86400000 })).toBeNull();
+    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", now })).toMatchObject({ durationSeconds: 900, expiresAt: now + 18 * 60 * 60 * 1000 });
+    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", now: now + 18 * 60 * 60 * 1000 })).toBeNull();
     await t.run(async (ctx) => {
       const session = (await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", tokenHash)).unique())!;
       await ctx.db.patch(session._id, { expiresAt: now + 60 * 86400000 });
@@ -184,7 +245,7 @@ describe("extension credential backend", () => {
     await expect(identity.query(api.rewards.youtubePricingRates, {})).resolves.toEqual({ standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6 });
     await identity.mutation(api.rewards.setYouTubePricingRates, { standardCoinsPerMinute: 1.25, shortsCoinsPerMinute: 2.5, flexibleCoinsPerMinute: 1.6 });
     const standardQuote = await identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900, now });
-    expect(standardQuote).toMatchObject({ price: 19, rateCoinsPerMinute: 1.25, entitlementDays: 30 });
+    expect(standardQuote).toMatchObject({ price: 19, rateCoinsPerMinute: 1.25, entitlementHours: 18 });
     await identity.mutation(api.rewards.initialize);
     await t.run(async (ctx) => {
       const account = await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
@@ -196,8 +257,9 @@ describe("extension credential backend", () => {
       idempotencyKey: "locked-quote-000001", quoteId: standardQuote.quoteId, now,
     });
     expect(lockedPurchase).toMatchObject({ success: true, price: 19 });
-    const shortsQuote = await identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "lmnopqrstuv", contentType: "youtube_short", durationSeconds: 900, now });
-    expect(shortsQuote).toMatchObject({ price: 38, rateCoinsPerMinute: 2.5 });
+    await expect(identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "lmnopqrstuv", contentType: "youtube_short", durationSeconds: 900, now })).rejects.toThrow(/purchased by time/);
+    const shortsQuote = await identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "lmnopqrstuv", contentType: "youtube_video", durationSeconds: 900, now });
+    expect(shortsQuote).toMatchObject({ price: 150, rateCoinsPerMinute: 10 });
     await expect(identity.query(internal.rewards.extensionYouTubePricingRates, { tokenHash, now })).resolves.toEqual({ standardCoinsPerMinute: 10, shortsCoinsPerMinute: 2.5, flexibleCoinsPerMinute: 1.6 });
     await expect(identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "invalid", contentType: "youtube_video", durationSeconds: 900, now })).rejects.toThrow(/Invalid YouTube/);
     await expect(identity.mutation(api.rewards.setYouTubePricingRates, { standardCoinsPerMinute: 0, shortsCoinsPerMinute: 1, flexibleCoinsPerMinute: 1 })).rejects.toThrow(/rate must be greater than 0/i);
@@ -222,15 +284,25 @@ describe("extension credential backend", () => {
       const account = (await ctx.db.query("accountData").collect()).find((item: Doc<"accountData">) => item.userId === userId);
       await ctx.db.patch(account!._id, { coins: 100 });
     });
-    const args = { videoId: "abcdefghijk", contentType: "youtube_short" as const, durationSeconds: 30, idempotencyKey: "short-key-000001", now };
+    const args = { videoId: "abcdefghijk", contentType: "youtube_video" as const, durationSeconds: 30, idempotencyKey: "short-key-000001", now };
     const quote = await identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash: validHash, videoId: args.videoId, contentType: args.contentType, durationSeconds: args.durationSeconds, now });
     await expect(identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: "4".repeat(64), quoteId: quote.quoteId })).rejects.toThrow(/expired or revoked/);
     await expect(identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: expiredHash, quoteId: quote.quoteId })).rejects.toThrow(/expired or revoked/);
     await expect(identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: revokedHash, quoteId: quote.quoteId })).rejects.toThrow(/expired or revoked/);
     await expect(identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: validHash, quoteId: quote.quoteId, durationSeconds: 6 * 60 * 60 + 1 })).rejects.toThrow(/Invalid YouTube/);
-    const shortPurchase = await identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: validHash, quoteId: quote.quoteId });
-    expect(shortPurchase).toMatchObject({ success: true, price: 1 });
-    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash: validHash, videoId: "abcdefghijk", contentType: "youtube_short", now })).toMatchObject({ durationSeconds: 30 });
+    await expect(identity.mutation(internal.rewards.purchaseYouTubeReward, { ...args, tokenHash: validHash, contentType: "youtube_short", quoteId: quote.quoteId })).rejects.toThrow(/Shorts use time-based access/);
+    await t.run(async (ctx) => {
+      const account = (await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique())!;
+      await ctx.db.patch(account._id, { coins: 0 });
+    });
+    await expect(identity.mutation(internal.rewards.purchaseShortsTime, { tokenHash: validHash, minutes: 5, idempotencyKey: "short-key-000002", now })).rejects.toThrow(/INSUFFICIENT_COINS/);
+    await t.run(async (ctx) => {
+      const account = (await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique())!;
+      await ctx.db.patch(account._id, { coins: 100 });
+    });
+    const shortPurchase = await identity.mutation(internal.rewards.purchaseShortsTime, { tokenHash: validHash, minutes: 5, idempotencyKey: "short-key-000003", now });
+    expect(shortPurchase).toMatchObject({ success: true, price: 7 });
+    expect(await identity.query(internal.rewards.verifyYouTubeEntitlement, { tokenHash: validHash, videoId: "abcdefghijk", contentType: "youtube_short", now })).toMatchObject({ expiresAt: now + 5 * 60_000, durationSeconds: null });
   });
 
   it("charges only the authenticated extension session through the HTTP API and verifies Shorts entitlements", async () => {
@@ -251,52 +323,41 @@ describe("extension credential backend", () => {
     const ratesResponse = await t.fetch("/extension/youtube/pricing-rates", { headers });
     expect(ratesResponse.status).toBe(200);
     expect(await ratesResponse.json()).toEqual({ standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 4, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false });
+    const deniedShortQuote = await t.fetch("/extension/youtube/quote", { method: "POST", headers, body: JSON.stringify({ videoId: "abcdefghijk", contentType: "youtube_short", durationSeconds: 30 }) });
+    expect(deniedShortQuote.status).toBe(400);
     const quoteResponse = await t.fetch("/extension/youtube/quote", { method: "POST", headers, body: JSON.stringify({
-      videoId: "abcdefghijk", contentType: "youtube_short", durationSeconds: 30,
+      videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900,
       price: 0, rateCoinsPerMinute: 0.01, flexibleCoinsPerMinute: 100,
     }) });
     expect(quoteResponse.status).toBe(200);
     const quote = await quoteResponse.json() as { quoteId: string; price: number };
-    expect(quote.price).toBe(2);
+    expect(quote.price).toBe(18);
     const requestBody = {
-      videoId: "abcdefghijk", contentType: "youtube_short", durationSeconds: 30,
+      videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900,
       idempotencyKey: "http-purchase-key-01", quoteId: quote.quoteId, userId: otherId, price: 1, cost: 1,
     };
     const response = await t.fetch("/extension/youtube/purchase", { method: "POST", headers, body: JSON.stringify(requestBody) });
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ success: true, price: 2, alreadyProcessed: false });
+    expect(await response.json()).toMatchObject({ success: true, price: 18, alreadyProcessed: false });
     const retry = await t.fetch("/extension/youtube/purchase", { method: "POST", headers, body: JSON.stringify(requestBody) });
-    expect(await retry.json()).toMatchObject({ success: true, price: 2, alreadyProcessed: true });
-    const pendingQuoteResponse = await t.fetch("/extension/youtube/quote", { method: "POST", headers, body: JSON.stringify({ videoId: "lmnopqrstuv", contentType: "youtube_short", durationSeconds: 30 }) });
-    const pendingQuote = await pendingQuoteResponse.json() as { quoteId: string; price: number };
-    expect(pendingQuote.price).toBe(2);
-    await identity.mutation(api.rewards.setYouTubePricingRates, { standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 50, flexibleCoinsPerMinute: 1.6 });
-    const staleQuotePurchase = await t.fetch("/extension/youtube/purchase", { method: "POST", headers, body: JSON.stringify({
-      videoId: "lmnopqrstuv", contentType: "youtube_short", durationSeconds: 30,
-      idempotencyKey: "http-stale-quote-01", quoteId: pendingQuote.quoteId, price: 0, cost: 0,
-    }) });
-    expect(staleQuotePurchase.status).toBe(200);
-    expect(await staleQuotePurchase.json()).toMatchObject({ success: true, price: 2 });
-    const currentQuoteResponse = await t.fetch("/extension/youtube/quote", { method: "POST", headers, body: JSON.stringify({ videoId: "12345678901", contentType: "youtube_short", durationSeconds: 30 }) });
-    const currentQuote = await currentQuoteResponse.json() as { quoteId: string; price: number };
-    expect(currentQuote.price).toBe(25);
-    const forgedPrice = await t.fetch("/extension/youtube/purchase", { method: "POST", headers, body: JSON.stringify({
-      videoId: "12345678901", contentType: "youtube_short", durationSeconds: 30,
-      idempotencyKey: "http-forged-price-01", quoteId: currentQuote.quoteId, price: 0, cost: 0,
-    }) });
-    expect(forgedPrice.status).toBe(200);
-    expect(await forgedPrice.json()).toMatchObject({ success: true, price: 25 });
-    const entitlement = await t.fetch("/extension/youtube/entitlement?videoId=abcdefghijk&contentType=youtube_short", { headers });
+    expect(await retry.json()).toMatchObject({ success: true, price: 18, alreadyProcessed: true });
+    const shortsRequest = { minutes: 5, idempotencyKey: "http-shorts-time-01" };
+    const shortsPurchase = await t.fetch("/extension/youtube/shorts-time", { method: "POST", headers, body: JSON.stringify(shortsRequest) });
+    expect(shortsPurchase.status).toBe(200);
+    expect(await shortsPurchase.json()).toMatchObject({ success: true, price: 20, expiresAt: expect.any(Number) });
+    const shortsRetry = await t.fetch("/extension/youtube/shorts-time", { method: "POST", headers, body: JSON.stringify(shortsRequest) });
+    expect(await shortsRetry.json()).toMatchObject({ success: true, price: 20, alreadyProcessed: true });
+    const entitlement = await t.fetch("/extension/youtube/entitlement?videoId=lmnopqrstuv&contentType=youtube_short", { headers });
     expect(entitlement.status).toBe(200);
-    expect(await entitlement.json()).toMatchObject({ unlocked: true, durationSeconds: 30 });
+    expect(await entitlement.json()).toMatchObject({ unlocked: true, durationSeconds: null });
     const state = await t.run(async (ctx) => ({
       account: (await ctx.db.query("accountData").collect()).find((item: Doc<"accountData">) => item.userId === userId),
       other: (await ctx.db.query("accountData").collect()).find((item: Doc<"accountData">) => item.userId === otherId),
       transactions: (await ctx.db.query("walletTransactions").collect()).filter((item: Doc<"walletTransactions">) => item.userId === userId),
     }));
-    expect(state.account?.coins).toBe(71);
+    expect(state.account?.coins).toBe(62);
     expect(state.other).toBeUndefined();
-    expect(state.transactions).toHaveLength(3);
+    expect(state.transactions).toHaveLength(2);
     const noSession = await t.fetch("/extension/youtube/purchase", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
     expect(noSession.status).toBe(401);
   });
@@ -356,6 +417,31 @@ describe("extension credential backend", () => {
     })).rejects.toThrow(/INSUFFICIENT_COINS/);
     const transactions = await t.run(async (ctx) => await ctx.db.query("walletTransactions").collect());
     expect(transactions).toHaveLength(1);
+  });
+
+  it("allows a confirmed transaction to be recovered after its display quote expires", async () => {
+    const t = createTest();
+    const { userId, identity } = await createApprovedUser(t, "retry-after-expiry@example.com");
+    await identity.mutation(api.rewards.initialize);
+    const now = Date.now();
+    const tokenHash = "9".repeat(64);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("extensionSessions", { tokenHash, userId, createdAt: now, expiresAt: now + 60 * 60_000 });
+      const account = (await ctx.db.query("accountData").withIndex("by_user", (q) => q.eq("userId", userId)).unique())!;
+      await ctx.db.patch(account._id, { coins: 10 });
+    });
+    const quote = await identity.mutation(internal.rewards.youtubePurchaseQuote, { tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 60, now });
+    const first = await identity.mutation(internal.rewards.purchaseYouTubeReward, {
+      tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 60,
+      idempotencyKey: "recovery-expiry-key-01", quoteId: quote.quoteId, now,
+    });
+    expect(first).toMatchObject({ success: true, price: 2 });
+    const retry = await identity.mutation(internal.rewards.purchaseYouTubeReward, {
+      tokenHash, videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 60,
+      idempotencyKey: "recovery-expiry-key-01", quoteId: quote.quoteId, now: now + 6 * 60_000,
+    });
+    expect(retry).toMatchObject({ success: true, alreadyProcessed: true, price: 2, expiresAt: now + 18 * 60 * 60_000 });
+    expect(await identity.query(api.rewards.snapshot)).toMatchObject({ coins: 8 });
   });
 
   it("rejects network failures without claiming success and allows retries with the same idempotency key", async () => {

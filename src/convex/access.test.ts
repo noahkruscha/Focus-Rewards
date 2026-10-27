@@ -451,6 +451,44 @@ describe("private beta access", () => {
     expect(snapshot.transactions.filter((transaction) => transaction.type === "library_purchase")).toHaveLength(1);
   });
 
+  it("deactivates accounts without deleting financial history, revokes access credentials, and protects administrators", async () => {
+    const t = createTest();
+    const { admin } = await makeAdmin(t);
+    const userId = await createUser(t, "deactivate@example.com");
+    await admin.mutation(api.access.approveUser, { userId });
+    const user = t.withIdentity({ subject: `${userId}|managed-user`, email: "deactivate@example.com" });
+    await user.mutation(api.rewards.initialize);
+    const { otherUserId, otherUser } = await (async () => {
+      const otherUserId = await createUser(t, "other@example.com");
+      await admin.mutation(api.access.approveUser, { userId: otherUserId });
+      return { otherUserId, otherUser: t.withIdentity({ subject: `${otherUserId}|other-user`, email: "other@example.com" }) };
+    })();
+    const { codeId, otherCodeId } = await t.run(async (ctx) => {
+      const codeId = await ctx.db.insert("extensionPairingCodes", { codeHash: "a".repeat(64), userId, createdAt: Date.now() - 120_000, expiresAt: Date.now() - 60_000 });
+      const otherCodeId = await ctx.db.insert("extensionPairingCodes", { codeHash: "c".repeat(64), userId: otherUserId, createdAt: Date.now() - 120_000, expiresAt: Date.now() - 60_000 });
+      await ctx.db.insert("extensionSessions", { tokenHash: "b".repeat(64), userId, createdAt: Date.now(), expiresAt: Date.now() + 60_000 });
+      await ctx.db.insert("walletTransactions", { userId, amount: 9, type: "focus_reward", description: "audit", idempotencyKey: "keep", createdAt: Date.now() });
+      return { codeId, otherCodeId };
+    });
+    await expect(user.mutation(api.access.deleteExtensionPairingCode, { codeId: otherCodeId })).rejects.toThrow(/Pairing code not found/);
+    await otherUser.mutation(api.access.deleteExtensionPairingCode, { codeId: otherCodeId });
+    await expect(t.run(async (ctx) => ctx.db.get(otherCodeId))).resolves.toBeNull();
+    const activeCodeId = await t.run(async (ctx) => await ctx.db.insert("extensionPairingCodes", { codeHash: "d".repeat(64), userId, createdAt: Date.now(), expiresAt: Date.now() + 60_000 }));
+    await expect(user.mutation(api.access.deleteExtensionPairingCode, { codeId: activeCodeId })).rejects.toThrow(/Revoke this active/);
+    await admin.mutation(api.access.deactivateUser, { userId });
+    await expect(admin.mutation(api.access.deactivateUser, { userId })).resolves.toMatchObject({ alreadyDeactivated: true });
+    await expect(user.query(api.rewards.snapshot)).rejects.toThrow();
+    const retained = await t.run(async (ctx) => ({
+      transactions: (await ctx.db.query("walletTransactions").collect()).filter((item) => item.userId === userId),
+      pairing: await ctx.db.get(codeId),
+      sessions: (await ctx.db.query("extensionSessions").collect()).filter((item) => item.userId === userId),
+    }));
+    expect(retained.transactions).toHaveLength(1);
+    expect(retained.pairing).toBeDefined();
+    expect(retained.sessions[0].revokedAt).toBeDefined();
+    await expect(admin.mutation(api.access.deactivateUser, { userId: await t.run(async (ctx) => (await ctx.db.query("users").filter((q) => q.eq(q.field("role"), "admin")).first())!._id) })).rejects.toThrow(/own administrator/);
+  });
+
   it("uses Web Crypto to generate independent invitation codes", async () => {
     const t = createTest();
     const { admin } = await makeAdmin(t);
