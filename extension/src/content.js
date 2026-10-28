@@ -4,7 +4,7 @@
   const SETTING = "youtubePriceIndicatorEnabled";
   const DEFAULT_STANDARD_RATE = 1.2;
   const DEFAULT_SHORTS_RATE = 1.4;
-  const CARD_SELECTOR = "ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer";
+  const CARD_SELECTOR = "ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, ytd-reel-shelf-renderer";
   const DURATION_SELECTOR = "ytd-thumbnail-overlay-time-status-renderer, yt-thumbnail-badge-view-model";
   const BADGE_CLASS = "fr-youtube-price";
   const LIVE_OR_DURATION_SELECTOR = "ytd-thumbnail-overlay-time-status-renderer, ytd-badge-supported-renderer";
@@ -23,6 +23,8 @@
   let balanceRefreshTimer = 0;
   let balanceRequestId = 0;
   let entitlementExpiryTimer = 0;
+  let entitlementExpiryKey = null;
+  let entitlementExpiryAt = null;
   let entitlementCheckKey = null;
   let entitlementCheckPromise = null;
   let entitlementCheckCompletedKey = null;
@@ -31,9 +33,13 @@
   let shortsLastTickAt = null;
   let nextShortsReminderMinute = 10;
   let shortsReminderTimer = 0;
+  let shortsRendererIdentitySeen = false;
   let observer;
   let scanTimer = 0;
   let pricingRates = { standardCoinsPerMinute: DEFAULT_STANDARD_RATE, shortsCoinsPerMinute: DEFAULT_SHORTS_RATE, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false };
+  const estimateCache = new Map();
+  const estimateRequests = new Map();
+  let shortsRouteActive = false;
 
   function isLive(card) {
     return Array.from(card.querySelectorAll(LIVE_OR_DURATION_SELECTOR)).some((node) => {
@@ -78,13 +84,154 @@
   function currentContent() {
     const path = location.pathname;
     const short = path.match(/^\/shorts\/([A-Za-z0-9_-]{11})\/?$/);
-    if (short) return { videoId: short[1], contentType: "youtube_short" };
+    if (short) {
+      shortsRouteActive = true;
+      const activeVideoId = activeShortVideoId();
+      if (activeVideoId) return { videoId: activeVideoId, contentType: "youtube_short" };
+      // Once a Shorts surface has been resolved, YouTube briefly removes its
+      // active renderer while swapping clips. Do not interpret that gap as a
+      // new video (or re-open the gate); initial direct loads still use the URL
+      // ID until an active renderer becomes available.
+      if (shortsRouteActive && shortsRendererIdentitySeen && (shortsHosts().length > 0 || shortRendererExists())) return null;
+      return { videoId: short[1], contentType: "youtube_short" };
+    }
+    if (!path.startsWith("/shorts/")) shortsRouteActive = false;
     const videoId = path === "/watch" ? new URL(location.href).searchParams.get("v") : null;
     return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId) ? { videoId, contentType: "youtube_video" } : null;
   }
 
   function serverNow() {
     return Date.now() + serverClockOffsetMs;
+  }
+
+  function entitlementKeyFor(content) {
+    return content.contentType === "youtube_short" ? "youtube_short:account" : `${content.contentType}:${content.videoId}`;
+  }
+
+  function openShadowRoots(roots) {
+    const pending = [...roots];
+    const visited = new Set();
+    const shadowRoots = new Set();
+    while (pending.length) {
+      const root = pending.pop();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      if (root.shadowRoot) {
+        shadowRoots.add(root.shadowRoot);
+        pending.push(root.shadowRoot);
+      }
+      for (const element of root.querySelectorAll?.("*") ?? []) {
+        if (element.shadowRoot) {
+          shadowRoots.add(element.shadowRoot);
+          pending.push(element.shadowRoot);
+        }
+      }
+    }
+    return [...shadowRoots];
+  }
+
+  function queryOpenShadowRoots(selector, roots) {
+    const matches = new Set();
+    const scopes = [...new Set([...roots, ...openShadowRoots(roots)])];
+    for (const root of scopes) {
+      if (root.matches?.(selector)) matches.add(root);
+      for (const element of root.querySelectorAll?.(selector) ?? []) matches.add(element);
+    }
+    return [...matches];
+  }
+
+  function shortsHosts() {
+    return [...document.querySelectorAll("ytd-shorts, ytd-reel-video-renderer")];
+  }
+
+  function activeShortRenderers() {
+    return [...new Set([
+      ...document.querySelectorAll("ytd-reel-video-renderer[is-active]"),
+      ...queryOpenShadowRoots("ytd-reel-video-renderer[is-active]", shortsHosts()),
+    ])];
+  }
+
+  function shortRendererExists() {
+    return queryOpenShadowRoots("ytd-reel-video-renderer", shortsHosts()).length > 0;
+  }
+
+  function activeShortVideoId() {
+    for (const renderer of activeShortRenderers()) {
+      const videoId = renderer.getAttribute?.("video-id");
+      if (videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+        shortsRendererIdentitySeen = true;
+        return videoId;
+      }
+    }
+    return null;
+  }
+
+  function hasValidShortsGrant() {
+    return entitlementState === "unlocked" && entitlementExpiresAt !== null
+      && entitlementExpiresAt > serverNow() && entitlementCheckCompletedKey === "youtube_short:account";
+  }
+
+  function hasCompletedShortsCheck() {
+    return entitlementCheckCompletedKey === "youtube_short:account";
+  }
+
+  function hasValidEntitlement(content) {
+    return Boolean(content && entitlementState === "unlocked" && entitlementExpiresAt !== null
+      && entitlementExpiresAt > serverNow() && entitlementCheckCompletedKey === entitlementKeyFor(content));
+  }
+
+  function activeYouTubePlayers() {
+    const players = new Set(document.querySelectorAll("video.html5-main-video, ytd-shorts video, ytd-reel-video-renderer[is-active] video, #shorts-player video, ytd-shorts #player-container video, ytd-reel-video-renderer[is-active] #player-container video"));
+    for (const video of queryOpenShadowRoots("video.html5-main-video, video", shortsHosts())) players.add(video);
+    const standardVideo = document.querySelector("ytd-player video.html5-main-video");
+    if (standardVideo) players.add(standardVideo);
+    return [...players];
+  }
+
+  function activeYouTubePlayerApis() {
+    const players = new Set(document.querySelectorAll("ytd-player #movie_player, ytd-shorts #movie_player, #shorts-player"));
+    const renderers = activeShortRenderers();
+    const scopes = renderers.length ? renderers : shortsHosts();
+    for (const player of queryOpenShadowRoots("#movie_player, #shorts-player", scopes)) players.add(player);
+    return [...players];
+  }
+
+  const guardedShortVideos = new WeakSet();
+  const observedShortRoots = new WeakSet();
+  let shortPlaybackGuard = null;
+
+  function installShortVideoGuard(video) {
+    if (!video || typeof video.addEventListener !== "function") return;
+    if (!guardedShortVideos.has(video)) {
+      guardedShortVideos.add(video);
+      video.addEventListener("play", (event) => shortPlaybackGuard?.(event), true);
+      video.addEventListener("playing", (event) => shortPlaybackGuard?.(event), true);
+    }
+    if (video.paused === false) shortPlaybackGuard?.({ target: video });
+  }
+
+  function installShortPlaybackGuards() {
+    if (!shortPlaybackGuard) return;
+    const hosts = shortsHosts();
+    const roots = openShadowRoots(hosts);
+    const videos = new Set(queryOpenShadowRoots("video.html5-main-video, video", hosts));
+    for (const video of activeYouTubePlayers()) videos.add(video);
+    for (const video of videos) installShortVideoGuard(video);
+    for (const root of roots) {
+      if (observedShortRoots.has(root)) continue;
+      observedShortRoots.add(root);
+      const rootObserver = new MutationObserver(() => {
+        for (const video of queryOpenShadowRoots("video.html5-main-video, video", hosts)) installShortVideoGuard(video);
+        scheduleScan();
+      });
+      rootObserver.observe(root, { childList: true, subtree: true });
+    }
+  }
+
+  function currentVideoTitle() {
+    const shortTitle = activeShortRenderers().map((renderer) => renderer.querySelector?.("h2")?.textContent
+      || queryOpenShadowRoots("h2", [renderer]).map((heading) => heading.textContent).find(Boolean)).find(Boolean);
+    return (document.querySelector("h1.ytd-watch-metadata")?.textContent || shortTitle || "").trim().slice(0, 200);
   }
 
   function extensionRequest(type, payload = {}) {
@@ -186,14 +333,17 @@
       if (entitlementState !== "unlocked" || entitlementExpiresAt !== currentShortsExpiry) {
         entitlementState = "unlocked";
         entitlementExpiresAt = currentShortsExpiry;
+        entitlementCheckCompletedKey = entitlementKeyFor(content);
         document.documentElement.classList.remove("fr-youtube-blocked");
         pauseCurrentPlayer(false);
         armEntitlementExpiry(content, currentShortsExpiry);
         startShortsReminderTimer();
       }
-    } else if (currentContent()?.contentType === "youtube_short" && entitlementState === "unlocked") {
+    } else if (currentContent()?.contentType === "youtube_short" && hasValidShortsGrant()
+      && entitlementExpiresAt <= serverNow()) {
       entitlementState = "checking";
       entitlementExpiresAt = null;
+      entitlementCheckCompletedKey = null;
       shortsWatchedMs = 0;
       shortsLastTickAt = null;
       nextShortsReminderMinute = 10;
@@ -208,6 +358,22 @@
 
   function renderPurchaseUi(forceOpen = false) {
     const content = currentContent();
+    if (!content && location.pathname.startsWith("/shorts/")) {
+      shortsPurchasePanelOpen = false;
+      // Keep the authorization decision intact while YouTube swaps reel
+      // renderers, but hide its stale video-specific panel until the next
+      // active video ID can be verified.
+      document.querySelectorAll(".fr-youtube-purchase").forEach((node) => { node.hidden = true; });
+      if (hasValidShortsGrant()) {
+        document.documentElement.classList.remove("fr-youtube-blocked");
+        pauseCurrentPlayer(false);
+      } else {
+        if (!hasCompletedShortsCheck()) entitlementState = "checking";
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      }
+      return;
+    }
     if (!content) {
       activeContentKey = null;
       entitlementState = "unlocked";
@@ -218,15 +384,31 @@
       updateBalance();
       return;
     }
-    if (activeContentKey !== `${content.contentType}:${content.videoId}`) {
+    const nextContentKey = `${content.contentType}:${content.videoId}`;
+    document.querySelectorAll(".fr-youtube-purchase").forEach((node) => { node.hidden = false; });
+    if (activeContentKey !== nextContentKey) {
+      const keepShortsAccess = content.contentType === "youtube_short" && hasValidShortsGrant();
+      const keepShortsDenial = content.contentType === "youtube_short"
+        && entitlementState === "blocked" && hasCompletedShortsCheck();
       if (content.contentType !== "youtube_short") stopShortsReminderTimer();
-      shortsLastTickAt = null;
+      if (!keepShortsAccess) shortsLastTickAt = null;
       shortsPurchasePanelOpen = false;
-      entitlementCheckCompletedKey = null;
-      entitlementState = "checking";
-      entitlementExpiresAt = null;
-      document.documentElement.classList.add("fr-youtube-blocked");
-      pauseCurrentPlayer();
+      if (!keepShortsAccess && !keepShortsDenial) {
+        entitlementCheckCompletedKey = null;
+        entitlementState = "checking";
+        entitlementExpiresAt = null;
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      } else if (keepShortsAccess) {
+        document.documentElement.classList.remove("fr-youtube-blocked");
+        pauseCurrentPlayer(false);
+        startShortsReminderTimer();
+      } else if (keepShortsDenial) {
+        // The account-wide Shorts check already denied access. Once the new
+        // active renderer has an identity, enforce that denial on its player.
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      }
     }
     const host = pageContext();
     updateBalance();
@@ -248,6 +430,10 @@
       shortsPurchasePanelOpen = false;
       document.querySelectorAll(".fr-youtube-purchase").forEach((node) => node.remove());
       document.documentElement.classList.remove("fr-youtube-blocked");
+      if (content.contentType === "youtube_short") {
+        armEntitlementExpiry(content, entitlementExpiresAt);
+        startShortsReminderTimer();
+      }
       return;
     }
     if (pendingPurchase && pendingPurchase.contentKey !== contentKey) pendingPurchase = null;
@@ -340,8 +526,10 @@
       action.disabled = true;
       message.textContent = "Kauf wird sicher vom Server geprüft…";
       pendingPurchase ??= { contentKey, idempotencyKey: makeIdempotencyKey() };
+      const purchasedContentKey = `${content.contentType}:${content.videoId}`;
       const result = await extensionRequest("youtube-purchase", {
         videoId: content.videoId,
+        videoTitle: videoHeading.textContent?.trim().slice(0, 200) || undefined,
         contentType: content.contentType,
         durationSeconds,
         idempotencyKey: pendingPurchase.idempotencyKey,
@@ -349,10 +537,19 @@
       });
       if (result.ok) {
         pendingPurchase = null;
+        if (activeContentKey === purchasedContentKey && currentContent()?.videoId === content.videoId
+          && Number.isFinite(result.expiresAt) && result.expiresAt > serverNow()) {
+          entitlementState = "unlocked";
+          entitlementExpiresAt = result.expiresAt;
+          entitlementCheckCompletedKey = purchasedContentKey;
+          document.documentElement.classList.remove("fr-youtube-blocked");
+          panel.remove();
+          armEntitlementExpiry(content, result.expiresAt);
+          playCurrentPlayer(content);
+        }
         await refreshBalance();
-        if (panel.isConnected && panel.dataset.contentKey === `${content.contentType}:${content.videoId}`) {
+        if (panel.isConnected && panel.dataset.contentKey === purchasedContentKey) {
           message.textContent = result.alreadyOwned ? "Eine gültige Freischaltung wurde vom Server bestätigt." : `Kauf vom Server bestätigt. Gültig bis ${new Date(result.expiresAt).toLocaleDateString("de-DE")}.`;
-          await verifyContentEntitlement(content, panel);
         }
       } else if (result.kind === "insufficient-coins") {
         pendingPurchase = null;
@@ -416,17 +613,37 @@
           message.textContent = "Shorts-Zeit wird serverseitig geprüft…";
           pendingShortsPurchase ??= { contentKey, minutes, idempotencyKey: makeIdempotencyKey() };
           const purchase = await extensionRequest("youtube-shorts-time", { minutes, idempotencyKey: pendingShortsPurchase.idempotencyKey });
-          if (!panel.isConnected) { choice.disabled = false; return; }
+          if (!panel.isConnected) {
+            choice.disabled = false;
+            if (purchase.ok) {
+              pendingShortsPurchase = null;
+              currentShortsExpiry = purchase.expiresAt;
+              await refreshBalance();
+              const current = currentContent();
+              if (accountState.signedIn && current?.contentType === "youtube_short" && purchase.expiresAt > serverNow()) {
+                entitlementState = "unlocked";
+                entitlementExpiresAt = purchase.expiresAt;
+                entitlementCheckCompletedKey = entitlementKeyFor(current);
+                document.documentElement.classList.remove("fr-youtube-blocked");
+                armEntitlementExpiry(current, purchase.expiresAt);
+                startShortsReminderTimer();
+                playCurrentPlayer(current);
+              }
+            }
+            return;
+          }
           if (purchase.ok) {
             pendingShortsPurchase = null;
             currentShortsExpiry = purchase.expiresAt;
-            if (accountState.signedIn && activeContentKey === `${content.contentType}:${content.videoId}` && currentContent()?.contentType === "youtube_short") {
+            if (accountState.signedIn && activeContentKey === `${content.contentType}:${content.videoId}` && currentContent()?.contentType === "youtube_short" && purchase.expiresAt > serverNow()) {
               entitlementState = "unlocked";
               entitlementExpiresAt = purchase.expiresAt;
+              entitlementCheckCompletedKey = entitlementKeyFor(content);
               document.documentElement.classList.remove("fr-youtube-blocked");
-              pauseCurrentPlayer(false);
+              panel.remove();
               armEntitlementExpiry(content, purchase.expiresAt);
               startShortsReminderTimer();
+              playCurrentPlayer(content);
             }
             message.textContent = `Serverbestätigt. Shorts verfügbar bis ${new Date(purchase.expiresAt).toLocaleTimeString("de-DE")}.`;
             await refreshBalance();
@@ -470,7 +687,17 @@
   }
 
   function verifyContentEntitlement(content, panel) {
-    const key = `${content.contentType}:${content.videoId}`;
+    const key = entitlementKeyFor(content);
+    if (content.contentType === "youtube_short" && currentShortsExpiry !== null && currentShortsExpiry > serverNow()) {
+      entitlementState = "unlocked";
+      entitlementExpiresAt = currentShortsExpiry;
+      entitlementCheckCompletedKey = key;
+      document.documentElement.classList.remove("fr-youtube-blocked");
+      if (panel?.isConnected) panel.remove();
+      armEntitlementExpiry(content, currentShortsExpiry);
+      startShortsReminderTimer();
+      return Promise.resolve();
+    }
     if (entitlementCheckKey === key && entitlementCheckPromise) return entitlementCheckPromise;
     if (entitlementCheckCompletedKey === key && entitlementState !== "checking") return Promise.resolve();
     entitlementCheckKey = key;
@@ -483,22 +710,29 @@
     });
     const wrappedRequest = entitlementCheckPromise;
     return wrappedRequest;
-  }
-
-  async function performContentEntitlementCheck(content, panel, key) {
-    activeContentKey = key;
+  }  async function performContentEntitlementCheck(content, panel, key) {
     const result = await extensionRequest("youtube-entitlement", content);
-    if (activeContentKey !== key || currentContent()?.videoId !== content.videoId || currentContent()?.contentType !== content.contentType) return;
-    if (result.ok && result.unlocked) {
+    const latestContent = currentContent();
+    // Shorts entitlement is account-wide, not tied to the particular clip. An
+    // in-flight result remains valid during a brief renderer-less transition,
+    // while an actual route change away from Shorts invalidates it.
+    const sameEntitlementScope = content.contentType === "youtube_short"
+      ? (latestContent?.contentType === "youtube_short" || (!latestContent && location.pathname.startsWith("/shorts/")))
+      : latestContent?.contentType === content.contentType && latestContent.videoId === content.videoId;
+    if (!sameEntitlementScope) return;
+    const resolvedContent = latestContent ?? content;
+    if (result.ok && result.unlocked && Number.isFinite(result.expiresAt) && result.expiresAt > (Number.isFinite(result.serverTime) ? result.serverTime : serverNow())) {
+      if (Number.isFinite(result.serverTime)) serverClockOffsetMs = result.serverTime - Date.now();
       entitlementState = "unlocked";
       entitlementExpiresAt = result.expiresAt;
-      if (Number.isFinite(result.serverTime)) serverClockOffsetMs = result.serverTime - Date.now();
+      if (content.contentType === "youtube_short") currentShortsExpiry = result.expiresAt;
       entitlementCheckCompletedKey = key;
       if (content.contentType === "youtube_short") startShortsReminderTimer();
       document.documentElement.classList.remove("fr-youtube-blocked");
       pauseCurrentPlayer(false);
       if (panel?.isConnected) panel.remove();
-      armEntitlementExpiry(content, result.expiresAt);
+      armEntitlementExpiry(resolvedContent, result.expiresAt);
+      if (latestContent) playCurrentPlayer(latestContent);
       return;
     }
     if (!result.ok && result.kind !== "network") entitlementCheckCompletedKey = key;
@@ -627,7 +861,12 @@
   let reminderTimer = 0;
 
   function armEntitlementExpiry(content, expiresAt) {
+    const contentKey = `${content.contentType}:${content.videoId}`;
+    if (entitlementExpiryTimer && entitlementExpiryKey === contentKey && entitlementExpiryAt === expiresAt) return;
     if (entitlementExpiryTimer) window.clearTimeout(entitlementExpiryTimer);
+    entitlementExpiryTimer = 0;
+    entitlementExpiryKey = contentKey;
+    entitlementExpiryAt = expiresAt;
     if (!Number.isFinite(expiresAt)) return;
     const remainingMs = expiresAt - serverNow();
     if (remainingMs <= 0) {
@@ -638,7 +877,10 @@
       return;
     }
     entitlementExpiryTimer = window.setTimeout(() => {
-      if (activeContentKey !== `${content.contentType}:${content.videoId}`) return;
+      entitlementExpiryTimer = 0;
+      entitlementExpiryKey = null;
+      entitlementExpiryAt = null;
+      if (activeContentKey !== contentKey) return;
       if (expiresAt <= serverNow()) {
         entitlementState = "checking";
         entitlementExpiresAt = null;
@@ -659,9 +901,35 @@
   }
 
   function pauseCurrentPlayer(pause = true) {
-    const player = document.querySelector("video.html5-main-video") || document.querySelector("ytd-player #movie_player");
-    if (pause) { try { player?.pause?.(); } catch { /* player can be replaced during navigation */ } }
-    if (player) player.style.pointerEvents = entitlementState === "unlocked" ? "" : "none";
+    for (const player of activeYouTubePlayers()) {
+      if (pause && !player.paused) {
+        try { player.pause?.(); } catch { /* YouTube may replace the active Shorts player during navigation. */ }
+      }
+      if (player.style) player.style.pointerEvents = entitlementState === "unlocked" ? "" : "none";
+    }
+    if (pause) {
+      for (const youtubePlayer of activeYouTubePlayerApis()) {
+        if (youtubePlayer?.getPlayerState && youtubePlayer.getPlayerState() !== 2) {
+          try { youtubePlayer.pauseVideo?.(); } catch { /* Player can be detached while its state changes. */ }
+        }
+      }
+    }
+  }
+
+  function playCurrentPlayer(content) {
+    const current = currentContent();
+    if (!current || current.contentType !== content.contentType || current.videoId !== content.videoId
+      || entitlementState !== "unlocked" || entitlementExpiresAt === null || entitlementExpiresAt <= serverNow()) return;
+    for (const player of activeYouTubePlayers()) {
+      if (player.paused && typeof player.play === "function") {
+        const result = player.play();
+        result?.catch?.(() => { /* YouTube may require a user gesture; access is nevertheless unlocked. */ });
+      }
+      if (player.style) player.style.pointerEvents = "";
+    }
+    for (const youtubePlayer of activeYouTubePlayerApis()) {
+      try { youtubePlayer?.playVideo?.(); } catch { /* Player may be replaced during SPA navigation. */ }
+    }
   }
 
   function contentTypeForCard(card) {
@@ -672,6 +940,121 @@
       } catch { /* Ignore malformed YouTube card links. */ }
     }
     return "youtube_video";
+  }
+
+  function shouldUseServerEstimateCards() {
+    return location.pathname === "/playlist" || (location.pathname === "/watch" && Boolean(document.querySelector("#secondary")));
+  }
+
+  function shouldUseServerEstimate(card) {
+    return shouldUseServerEstimateCards() && (location.pathname === "/playlist" || Boolean(card.closest?.("#secondary")));
+  }
+
+  function renderEstimateBadge(card, menu, estimate, title) {
+    const row = menu.parentElement || menu;
+    const badge = card.querySelector(`.${BADGE_CLASS}`) || document.createElement("span");
+    badge.className = BADGE_CLASS;
+    badge.textContent = estimate.unlocked ? "✓ Freigeschaltet" : estimate.estimatedPrice === null ? "Preis nicht verfügbar" : `◈ ca. ${estimate.estimatedPrice} Coins`;
+    badge.setAttribute("title", title);
+    badge.setAttribute("aria-label", title);
+    if (badge.parentElement !== row || badge.nextElementSibling !== menu) row.insertBefore(badge, menu);
+    for (const duplicate of card.querySelectorAll(`.${BADGE_CLASS}`)) if (duplicate !== badge) duplicate.remove();
+  }
+
+  function cardVideo(card) {
+    const link = [...card.querySelectorAll("a[href]")].find((item) => {
+      try { return new URL(item.href, location.origin).pathname === "/watch"; } catch { return false; }
+    });
+    if (!link) return null;
+    const url = new URL(link.href, location.origin);
+    const videoId = url.searchParams.get("v");
+    return videoId && /^[A-Za-z0-9_-]{11}$/.test(videoId)
+      ? { videoId, durationSeconds: durationFor(card) }
+      : null;
+  }
+
+  function fetchServerEstimates(videos) {
+    if (!accountState.signedIn || !videos.length) return Promise.resolve(new Map());
+    const unique = [...new Map(videos.filter((video) => !estimateRequests.has(video.videoId))
+      .map((video) => [video.videoId, video])).values()].slice(0, 100);
+    if (!unique.length) return Promise.all(videos.map((video) => estimateRequests.get(video.videoId)).filter(Boolean))
+      .then((results) => new Map(results.flatMap((items) => [...items])));
+    const request = extensionRequest("youtube-estimates", { videos: unique }).then((result) => {
+      if (!result?.ok || !Array.isArray(result.videos)) return new Map();
+      if (Number.isFinite(result.serverTime)) serverClockOffsetMs = result.serverTime - Date.now();
+      const estimates = new Map(result.videos.map((item) => [item.videoId, { ...item, cachedAt: Date.now() }]));
+      for (const [videoId, estimate] of estimates) estimateCache.set(videoId, estimate);
+      return estimates;
+    }).finally(() => { for (const video of unique) estimateRequests.delete(video.videoId); });
+    for (const video of unique) estimateRequests.set(video.videoId, request);
+    return request;
+  }
+
+  function renderServerEstimateCards(cards) {
+    if (!shouldUseServerEstimateCards()) return;
+    if (!accountState.signedIn) {
+      cards.forEach((card) => {
+        if (contentTypeForCard(card) === "youtube_video") removeBadge(card);
+      });
+      return;
+    }
+    const entries = cards.map((card) => ({ card, menu: findMenu(card), video: cardVideo(card) }))
+      .filter((entry) => entry.menu && entry.video && contentTypeForCard(entry.card) === "youtube_video"
+        && shouldUseServerEstimate(entry.card));
+    const now = Date.now();
+    const pending = entries.filter(({ video }) => {
+      const cached = estimateCache.get(video.videoId);
+      return video.durationSeconds !== null && (!cached || now - cached.cachedAt >= 30_000)
+        && !estimateRequests.has(video.videoId);
+    }).slice(0, 100);
+    const apply = () => {
+      for (const { card, menu, video } of entries) {
+        const estimate = estimateCache.get(video.videoId);
+        if (estimate && menu) renderEstimateBadge(card, menu, estimate, estimate.unlocked
+          ? "Dieses Video hat bereits eine aktive Freischaltung."
+          : estimate.estimatedPrice === null ? "Für dieses Video ist keine Preisschätzung verfügbar." : "Geschätzter Preis; der Server bestätigt den tatsächlichen Kaufpreis.");
+      }
+      renderPlaylistTotal(entries);
+    };
+    apply();
+    if (pending.length) void fetchServerEstimates(pending.map(({ video }) => video)).then((estimates) => {
+      for (const { card, menu, video } of entries) {
+        const estimate = estimates.get(video.videoId) ?? estimateCache.get(video.videoId);
+        if (estimate && menu) renderEstimateBadge(card, menu, estimate, estimate.unlocked
+          ? "Dieses Video hat bereits eine aktive Freischaltung."
+          : estimate.estimatedPrice === null ? "Für dieses Video ist keine Preisschätzung verfügbar." : "Geschätzter Preis; der Server bestätigt den tatsächlichen Kaufpreis.");
+      }
+      renderPlaylistTotal(entries);
+      // Continue in bounded batches only when the current page had a full
+      // batch to send; failures and unknown-duration entries must not create a
+      // tight request/rescan loop.
+      if (pending.length === 100) scheduleScan();
+    });
+  }
+
+  function renderPlaylistTotal(entries) {
+    if (location.pathname !== "/playlist") return;
+    const unique = [...new Map(entries.filter(({ video }) => video).map(({ video }) => [video.videoId, video])).values()];
+    const estimates = unique.map(({ videoId }) => estimateCache.get(videoId));
+    let totalNode = document.querySelector(".fr-youtube-playlist-total");
+    if (!estimates.length) {
+      totalNode?.remove();
+      return;
+    }
+    if (!totalNode) {
+      totalNode = document.createElement("div");
+      totalNode.className = "fr-youtube-playlist-total";
+    }
+    const priced = estimates.filter((item) => item && !item.unlocked && Number.isSafeInteger(item.estimatedPrice));
+    const unknown = unique.filter(({ videoId }) => {
+      const estimate = estimateCache.get(videoId);
+      return !estimate || (!estimate.unlocked && estimate.estimatedPrice === null);
+    }).length;
+    const total = priced.reduce((sum, item) => sum + item.estimatedPrice, 0);
+    totalNode.textContent = `Playlist estimate only: ${total} Coins${unknown ? ` · incomplete (${unknown} unpriced)` : ""} · unlocked videos excluded · no batch purchase`;
+    const anchor = document.querySelector("ytd-playlist-header-renderer #play-button, ytd-playlist-header-renderer #primary ytd-playlist-play-button-renderer, ytd-playlist-header-renderer #primary button");
+    const header = document.querySelector("ytd-playlist-header-renderer #primary") || anchor?.parentElement;
+    if (header && totalNode.parentElement !== header) header.append(totalNode);
   }
 
   function updateCard(card) {
@@ -687,11 +1070,14 @@
     const durationSeconds = durationFor(card);
     const rate = contentType === "youtube_short" ? pricingRates.shortsCoinsPerMinute : pricingRates.standardCoinsPerMinute;
     const price = window.FocusRewardsPricing.priceForDurationSeconds(durationSeconds, rate);
+    if (contentType === "youtube_video" && shouldUseServerEstimate(card)) {
+      if (existing) removeBadge(card);
+      return;
+    }
     if (price === null) {
       if (existing) removeBadge(card);
       return;
     }
-
     const row = menu.parentElement || menu;
     const badge = existing || document.createElement("span");
     badge.className = BADGE_CLASS;
@@ -714,7 +1100,10 @@
 
   function scan() {
     scanTimer = 0;
-    if (enabled) document.querySelectorAll(CARD_SELECTOR).forEach(updateCard);
+    installShortPlaybackGuards();
+    const cards = [...document.querySelectorAll(CARD_SELECTOR)];
+    if (enabled) cards.forEach(updateCard);
+    renderServerEstimateCards(cards);
     renderPurchaseUi();
   }
 
@@ -738,15 +1127,42 @@
 
   function start() {
     const protectPlayback = (event) => {
-      if (!currentContent()) return;
-      if (entitlementState === "unlocked" && entitlementExpiresAt !== null && entitlementExpiresAt > serverNow()) return;
-      if (entitlementState === "unlocked") { entitlementState = "blocked"; entitlementExpiresAt = null; }
-      if (event.target instanceof HTMLVideoElement) { try { event.target.pause(); } catch { /* player navigation race */ } }
+      const content = currentContent();
+      if (!content) {
+        if (!location.pathname.startsWith("/shorts/")) return;
+        if (hasValidShortsGrant()) return;
+        document.documentElement.classList.add("fr-youtube-blocked");
+        const transitioningPlayer = event.target;
+        if (transitioningPlayer && typeof transitioningPlayer.pause === "function" && transitioningPlayer.paused === false) {
+          try { transitioningPlayer.pause(); } catch { /* YouTube may replace the active Shorts player during navigation. */ }
+        }
+        pauseCurrentPlayer();
+        return;
+      }
+      if (hasValidEntitlement(content)) {
+        if (content.contentType === "youtube_short" && event.target && typeof event.target.play === "function" && event.target.paused) {
+          const resumed = event.target.play();
+          resumed?.catch?.(() => { /* Resume may require a browser gesture; the server-approved access remains valid. */ });
+        }
+        return;
+      }
+      if (entitlementState === "unlocked") {
+        entitlementState = "checking";
+        entitlementExpiresAt = null;
+        entitlementCheckCompletedKey = null;
+      }
+      const player = event.target;
+      if (player && typeof player.pause === "function" && player.paused === false) {
+        try { player.pause(); } catch { /* YouTube may replace this player while navigating. */ }
+      }
       document.documentElement.classList.add("fr-youtube-blocked");
+      pauseCurrentPlayer();
       if (entitlementState === "blocked") renderPurchaseUi();
     };
+    shortPlaybackGuard = protectPlayback;
     document.addEventListener("play", protectPlayback, true);
     document.addEventListener("playing", protectPlayback, true);
+    installShortPlaybackGuards();
     if (currentContent()) { entitlementState = "checking"; document.documentElement.classList.add("fr-youtube-blocked"); pauseCurrentPlayer(); }
     observer = new MutationObserver(scheduleScan);
     observer.observe(document.documentElement, {
@@ -760,21 +1176,31 @@
       void extensionRequest("youtube-pricing-rates").then((result) => {
         if (result?.ok) {
           pricingRates = result;
+          estimateCache.clear();
           scheduleScan();
         }
       });
     };
     const handleNavigation = () => {
+      const next = currentContent();
+      const onShortsRoute = location.pathname.startsWith("/shorts/");
+      const retainShortsDecision = onShortsRoute && hasCompletedShortsCheck();
+      const retainAccountShortsGrant = onShortsRoute && hasValidShortsGrant();
       activeContentKey = null;
-      entitlementCheckCompletedKey = null;
-      if (!location.pathname.startsWith("/shorts/")) {
+      if (!onShortsRoute) shortsRendererIdentitySeen = false;
+      if (next?.contentType !== "youtube_short" && !retainShortsDecision) {
+        entitlementCheckCompletedKey = null;
         stopShortsReminderTimer();
         shortsLastTickAt = null;
       }
-      entitlementState = "checking";
-      entitlementExpiresAt = null;
-      document.documentElement.classList.add("fr-youtube-blocked");
-      pauseCurrentPlayer();
+      if (!retainAccountShortsGrant) {
+        entitlementState = "checking";
+        entitlementExpiresAt = null;
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      } else {
+        document.documentElement.classList.remove("fr-youtube-blocked");
+      }
       scheduleScan();
       renderPurchaseUi();
       refreshPricingRates();

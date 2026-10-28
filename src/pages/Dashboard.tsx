@@ -217,6 +217,7 @@ export default function Dashboard() {
   const [walletTransactions, setWalletTransactions] = useState<Array<{ id: string; amount: number; type: string; description: string; createdAt: number }>>([]);
   const [view, setView] = useState<View>("today");
   const [now, setNow] = useState(0);
+  const [serverNow, setServerNow] = useState(0);
   const [dailyCapInput, setDailyCapInput] = useState(String(data.dailyCap));
   const [taskBonusInput, setTaskBonusInput] = useState(String(data.taskBonus));
   const [taskDraft, setTaskDraft] = useState("");
@@ -249,6 +250,13 @@ export default function Dashboard() {
     });
     setWalletTransactions(snapshot.transactions);
   }, [snapshot]);
+  useEffect(() => {
+    if (!snapshot?.serverTime) return;
+    const clientTimeAtSync = Date.now();
+    const interval = window.setInterval(() => setServerNow(snapshot.serverTime + (Date.now() - clientTimeAtSync)), 1000);
+    return () => window.clearInterval(interval);
+  }, [snapshot?.serverTime]);
+
   useEffect(() => {
     if (user?.role !== "admin" || !snapshot?.initialized || snapshot.migrationCompletedAt) return;
     void previewLegacyMigration(localStorage).then(setMigrationPreview).catch((error: unknown) => setMigrationError(error instanceof Error ? error.message : "Could not inspect saved local data."));
@@ -285,6 +293,7 @@ export default function Dashboard() {
   const pendingTasks = data.tasks.filter((task) => !task.completed);
   const completedTasks = data.tasks.filter((task) => task.completed);
   const selectedVideo = SAMPLE_VIDEOS.find((video) => video.id === selectedVideoId) ?? null;
+  const serverNowMs = serverNow || snapshot?.serverTime || now;
   const videoCategories = ["All", ...new Set(SAMPLE_VIDEOS.map((video) => video.category))];
   const filteredVideos = SAMPLE_VIDEOS.filter((video) =>
     (catalogFilter === "All" || video.category === catalogFilter) &&
@@ -619,6 +628,7 @@ export default function Dashboard() {
                 <div className="extension-promo-copy"><span className="eyebrow">A MORE SEAMLESS WAY TO FOCUS</span><h2 id="extension-promo-title">Take Momentum Further</h2><p>Make earning and spending coins more convenient while you browse. The browser extension is on its way.</p></div>
                 <div className="extension-promo-action"><span className="extension-coming-soon">Coming Soon</span><button type="button" disabled aria-disabled="true" title="The Momentum browser extension is coming soon">Get the Browser Extension <ArrowUpRight size={14} /></button></div>
               </section>
+              {snapshot?.youtubeUnlocks ? <section className="glass-panel history-panel youtube-library" aria-labelledby="youtube-library-title"><div className="section-heading"><div><h2 id="youtube-library-title">Your YouTube unlocks</h2><p>Access is verified against your account and expires at the server-recorded time.</p></div></div>{snapshot.youtubeUnlocks.length ? <div className="session-list">{snapshot.youtubeUnlocks.map((unlock) => { const active = !unlock.revoked && unlock.expiresAt > serverNowMs; const remainingMs = Math.max(0, unlock.expiresAt - serverNowMs); return <div className="session-row" key={unlock.id}><div className="session-copy"><a href={unlock.url} target="_blank" rel="noreferrer"><strong>{unlock.title}</strong></a><span>{active ? `Active · ${Math.floor(remainingMs / 3_600_000)}h ${Math.floor((remainingMs % 3_600_000) / 60_000)}m remaining · expires ${new Date(unlock.expiresAt).toLocaleString()}` : unlock.revoked ? "Revoked" : `Expired · ${new Date(unlock.expiresAt).toLocaleString()}`}</span></div><span className={active ? "unlocked-status" : "soft-badge"}>{active ? "Active" : unlock.revoked ? "Revoked" : "Expired"}</span></div>; })}</div> : <div className="empty-state small-empty"><strong>No YouTube videos unlocked yet</strong><span>Videos unlocked in the browser extension will appear here.</span></div>}</section> : null}
               <div className="library-tools"><label className="library-search"><Search size={16} /><input aria-label="Search videos" placeholder="Search the library" value={videoQuery} onChange={(event) => setVideoQuery(event.target.value)} /><span>⌘ K</span></label><div className="library-balance"><Coins size={15} /> <strong>{data.coins}</strong> available</div></div>
               <div className="category-filters" aria-label="Filter videos by category">{videoCategories.map((category) => <button key={category} className={catalogFilter === category ? "filter-active" : ""} onClick={() => setCatalogFilter(category)}>{category}</button>)}</div>
               <div className="video-grid">{filteredVideos.map((video, index) => { const unlocked = data.videoUnlocks.some((unlock) => unlock.videoId === video.id); return <motion.article className="video-card" key={video.id} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * .04 }}><button className="video-artwork" style={{ background: `linear-gradient(145deg, ${video.colors[0]}, ${video.colors[1]})` }} onClick={() => openVideo(video)} aria-label={`Open ${video.title}`}><span className="artwork-symbol">{video.artwork}</span><span className="artwork-duration">{video.duration}</span>{unlocked && <span className="artwork-unlocked"><Check size={12} /> In your collection</span>}</button><div className="video-info"><div><span className="video-category">{video.category}</span><h2>{video.title}</h2></div><button className="video-open" aria-label={`View details for ${video.title}`} onClick={() => openVideo(video)}><ChevronRight size={17} /></button></div><div className="video-card-bottom"><span><Coins size={14} /> {unlocked ? "Unlocked" : `${video.price} coins`}</span><button className={unlocked ? "video-detail-button" : "video-unlock-button"} onClick={() => unlocked ? openVideo(video) : unlockVideo(video)}>{unlocked ? "Watch" : "Unlock"}</button></div></motion.article>; })}</div>

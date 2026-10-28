@@ -333,7 +333,7 @@ describe("extension credential backend", () => {
     const quote = await quoteResponse.json() as { quoteId: string; price: number };
     expect(quote.price).toBe(18);
     const requestBody = {
-      videoId: "abcdefghijk", contentType: "youtube_video", durationSeconds: 900,
+      videoId: "abcdefghijk", videoTitle: "Purchased from extension", contentType: "youtube_video", durationSeconds: 900,
       idempotencyKey: "http-purchase-key-01", quoteId: quote.quoteId, userId: otherId, price: 1, cost: 1,
     };
     const response = await t.fetch("/extension/youtube/purchase", { method: "POST", headers, body: JSON.stringify(requestBody) });
@@ -360,6 +360,64 @@ describe("extension credential backend", () => {
     expect(state.transactions).toHaveLength(2);
     const noSession = await t.fetch("/extension/youtube/purchase", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
     expect(noSession.status).toBe(401);
+  });
+
+  it("returns only the authenticated user's YouTube unlocks with canonical title and expiration times", async () => {
+    const t = createTest();
+    const { userId, identity } = await createApprovedUser(t, "library-owner@example.com");
+    const other = await createApprovedUser(t, "library-other@example.com");
+    await identity.mutation(api.rewards.initialize);
+    const now = Date.now();
+    const tokenHash = "9".repeat(64);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("extensionSessions", { tokenHash, userId, createdAt: now, expiresAt: now + 60_000 });
+      await ctx.db.insert("libraryPurchases", {
+        userId, rewardId: "youtube:youtube_video:abcdefghijk:60", contentType: "youtube_video", contentId: "abcdefghijk",
+        videoTitle: "Server stored title", durationSeconds: 60, entitlementHours: 18, cost: 2, purchasedAt: now,
+        expiresAt: now + 18 * 60 * 60_000, idempotencyKey: "youtube:test-library-entry",
+      });
+      await ctx.db.insert("libraryPurchases", {
+        userId: other.userId, rewardId: "youtube:youtube_video:lmnopqrstuv:60", contentType: "youtube_video", contentId: "lmnopqrstuv",
+        videoTitle: "Private other title", durationSeconds: 60, entitlementHours: 18, cost: 2, purchasedAt: now,
+        expiresAt: now + 18 * 60 * 60_000, idempotencyKey: "youtube:other-library-entry",
+      });
+    });
+    const snapshot = await identity.query(api.rewards.snapshot);
+    expect(snapshot.youtubeUnlocks).toEqual([{
+      id: expect.any(String), videoId: "abcdefghijk", title: "Server stored title", url: "https://www.youtube.com/watch?v=abcdefghijk",
+      cost: 2, purchasedAt: now, expiresAt: now + 18 * 60 * 60_000, revoked: false,
+    }]);
+    await expect(other.identity.query(api.rewards.snapshot)).resolves.toMatchObject({ youtubeUnlocks: [{ videoId: "lmnopqrstuv", title: "Private other title" }] });
+  });
+
+  it("calculates authenticated playlist estimates from server rates and excludes active unlocks", async () => {
+    const t = createTest();
+    const { userId, identity } = await createApprovedUser(t, "estimates@example.com");
+    const other = await createApprovedUser(t, "other-estimates@example.com");
+    await identity.mutation(api.rewards.initialize);
+    await identity.mutation(api.rewards.setYouTubePricingRates, { standardCoinsPerMinute: 2.5, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6 });
+    const now = Date.now();
+    const tokenHash = "8".repeat(64);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("extensionSessions", { tokenHash, userId, createdAt: now, expiresAt: now + 60_000 });
+      await ctx.db.insert("libraryPurchases", { userId, rewardId: "unlocked", contentType: "youtube_video", contentId: "abcdefghijk", cost: 5, purchasedAt: now, idempotencyKey: "unlocked", expiresAt: now + 60_000 });
+    });
+    const result = await t.query(internal.rewards.youtubePriceEstimates, {
+      tokenHash, now, videos: [
+        { videoId: "abcdefghijk", durationSeconds: 300 },
+        { videoId: "lmnopqrstuv", durationSeconds: 120 },
+        { videoId: "zyxwvutsrqp", durationSeconds: null },
+      ],
+    });
+    expect(result).toEqual({ standardCoinsPerMinute: 2.5, videos: [
+      { videoId: "abcdefghijk", unlocked: true, expiresAt: now + 60_000, estimatedPrice: null },
+      { videoId: "lmnopqrstuv", unlocked: false, expiresAt: null, estimatedPrice: 5 },
+      { videoId: "zyxwvutsrqp", unlocked: false, expiresAt: null, estimatedPrice: null },
+    ] });
+    await expect(t.query(internal.rewards.youtubePriceEstimates, { tokenHash, now, videos: [{ videoId: "abcdefghijk", durationSeconds: 60 }, { videoId: "abcdefghijk", durationSeconds: 60 }] })).rejects.toThrow(/Invalid YouTube estimate/);
+    const foreignTokenHash = "7".repeat(64);
+    await t.run(async (ctx) => await ctx.db.insert("extensionSessions", { tokenHash: foreignTokenHash, userId: other.userId, createdAt: now, expiresAt: now + 60_000 }));
+    await expect(other.identity.query(api.rewards.snapshot)).resolves.not.toMatchObject({ youtubeUnlocks: [{ videoId: "abcdefghijk" }] });
   });
 
   it("rejects concurrent purchases that exceed the shared wallet balance", async () => {

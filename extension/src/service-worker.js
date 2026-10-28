@@ -166,6 +166,21 @@
       }
       return { ok: true, quoteId: response.body.quoteId, price: response.body.price, rateCoinsPerMinute: response.body.rateCoinsPerMinute, entitlementHours: response.body.entitlementHours };
     }
+    if (type === "youtube-estimates") {
+      if (!Array.isArray(message.videos) || message.videos.length > 100
+        || message.videos.some((video) => !video || typeof video.videoId !== "string" || !/^[A-Za-z0-9_-]{11}$/.test(video.videoId)
+          || (video.durationSeconds !== null && (!Number.isSafeInteger(video.durationSeconds) || video.durationSeconds <= 0 || video.durationSeconds > 6 * 60 * 60)))) {
+        return { ok: false, kind: "input", message: "Ungültige Video-Schätzung." };
+      }
+      const response = await sendJson(`${credential.siteUrl}/extension/youtube/estimates`, {
+        method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ videos: message.videos }),
+      });
+      if (response.response.status === 401) { await clearCredential(); return { ok: false, kind: "unauthorized", error: "SESSION_REQUIRED" }; }
+      if (response.response.status === 503) return { ok: false, kind: "network", message: "Video estimates are temporarily unavailable." };
+      if (!response.response.ok || !Array.isArray(response.body.videos)) return { ok: false, kind: "rejected", message: "Video estimates could not be loaded." };
+      return { ok: true, ...response.body };
+    }
     if (type === "youtube-purchase") {
       if (videoPurchaseInFlight) return { ok: false, kind: "pending-purchase", message: "Ein Videokauf wird gerade geprüft. Bitte warte auf die Bestätigung." };
       videoPurchaseInFlight = true;
@@ -182,12 +197,13 @@
           durationSeconds: message.durationSeconds,
           idempotencyKey: message.idempotencyKey,
           quoteId: message.quoteId,
+          videoTitle: typeof message.videoTitle === "string" ? message.videoTitle.trim().slice(0, 200) : undefined,
         };
         await chrome.storage.local.set({ [PENDING_VIDEO_PURCHASE_KEY]: purchase });
         const response = await sendJson(`${credential.siteUrl}/extension/youtube/purchase`, {
           method: "POST",
           headers: { ...headers, "Content-Type": "application/json" },
-          body: JSON.stringify({ videoId: purchase.videoId, contentType: purchase.contentType, durationSeconds: purchase.durationSeconds, idempotencyKey: purchase.idempotencyKey, quoteId: purchase.quoteId }),
+          body: JSON.stringify({ videoId: purchase.videoId, videoTitle: purchase.videoTitle, contentType: purchase.contentType, durationSeconds: purchase.durationSeconds, idempotencyKey: purchase.idempotencyKey, quoteId: purchase.quoteId }),
         });
         const clearPending = async () => {
           const current = await chrome.storage.local.get([PENDING_VIDEO_PURCHASE_KEY]);
@@ -259,7 +275,7 @@
       request.then(sendResponse).catch(() => sendResponse({ ok: false, kind: "network", message: "Die Erweiterungssitzung konnte nicht geprüft werden." }));
       return true;
     }
-    if (!fromYouTubePage || !["status", "youtube-quote", "youtube-purchase", "youtube-entitlement", "youtube-pricing-rates", "youtube-balance", "youtube-shorts-time"].includes(message.type)) return false;
+    if (!fromYouTubePage || !["status", "youtube-quote", "youtube-purchase", "youtube-entitlement", "youtube-estimates", "youtube-pricing-rates", "youtube-balance", "youtube-shorts-time"].includes(message.type)) return false;
     const request = message.type === "status" ? status() : youtubeRequest(message.type, message);
     request.then(sendResponse).catch(() => sendResponse({ ok: false, kind: "network", message: "The request failed. Check your connection and try again." }));
     return true;

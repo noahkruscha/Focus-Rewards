@@ -191,6 +191,42 @@ http.route({
 });
 
 http.route({
+  path: "/extension/youtube/estimates",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+
+http.route({
+  path: "/extension/youtube/estimates",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (!isAllowedExtensionOrigin(request)) return jsonResponse({ error: "Origin not allowed." }, 403);
+    if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) return jsonResponse({ error: "Expected JSON." }, 415);
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonResponse({ error: "Invalid JSON." }, 400); }
+    if (typeof body !== "object" || body === null || !("videos" in body) || !Array.isArray(body.videos)
+      || body.videos.length > 100 || body.videos.some((item) => typeof item !== "object" || item === null
+        || !("videoId" in item) || typeof item.videoId !== "string"
+        || !("durationSeconds" in item) || (item.durationSeconds !== null && typeof item.durationSeconds !== "number"))) {
+      return jsonResponse({ error: "Invalid YouTube estimate request." }, 400);
+    }
+    const authenticated = await authenticatedExtensionSession(ctx, request);
+    if ("error" in authenticated) return authenticated.error;
+    try {
+      const result = await ctx.runQuery(internal.rewards.youtubePriceEstimates, {
+        tokenHash: authenticated.session.tokenHash, now: Date.now(),
+        videos: body.videos.map((item) => ({ videoId: item.videoId as string, durationSeconds: item.durationSeconds as number | null })),
+      });
+      return jsonResponse({ ...result, serverTime: Date.now() });
+    } catch (error) {
+      if (error instanceof ConvexError) return jsonResponse({ error: error.message }, error.message.startsWith("Extension session") ? 401 : 400);
+      console.error("[extension:youtube-estimates] Unexpected backend failure.");
+      return jsonResponse({ error: "YouTube estimates are temporarily unavailable." }, 503);
+    }
+  }),
+});
+
+http.route({
   path: "/extension/youtube/pricing-rates",
   method: "PUT",
   handler: httpAction(async (ctx, request) => {
@@ -247,12 +283,17 @@ http.route({
       || !("quoteId" in body) || typeof body.quoteId !== "string") {
       return jsonResponse({ error: "Invalid YouTube purchase request." }, 400);
     }
+    const purchaseBody = body as Record<string, unknown>;
+    if (purchaseBody.videoTitle !== undefined && typeof purchaseBody.videoTitle !== "string") {
+      return jsonResponse({ error: "Invalid YouTube purchase request." }, 400);
+    }
     const authenticated = await authenticatedExtensionSession(ctx, request);
     if ("error" in authenticated) return authenticated.error;
     try {
       const result = await ctx.runMutation(internal.rewards.purchaseYouTubeReward, {
         tokenHash: authenticated.session.tokenHash,
         videoId: body.videoId,
+        videoTitle: typeof purchaseBody.videoTitle === "string" ? purchaseBody.videoTitle.trim().slice(0, 200) : undefined,
         contentType: body.contentType,
         durationSeconds: body.durationSeconds,
         idempotencyKey: body.idempotencyKey,
