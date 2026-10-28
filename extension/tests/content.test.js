@@ -215,7 +215,7 @@ function makeDocument(cards, listeners = {}, navigation = {}) {
 
 test("injects YouTube content only on YouTube and limits backend hosts to Convex sites", () => {
   assert.deepEqual(manifest.content_scripts.flatMap((script) => script.matches), ["https://www.youtube.com/*"]);
-  assert.deepEqual(manifest.host_permissions, ["https://www.youtube.com/*", "https://*.convex.site/*"]);
+  assert.deepEqual(manifest.host_permissions, ["https://www.youtube.com/*", "https://*.convex.site/*", "http://127.0.0.1:3211/*", "http://localhost:3211/*"]);
 });
 
 test("adds one estimate in the options row and remains duplicate-safe after repeated scans", async () => {
@@ -629,6 +629,57 @@ test("hides the purchase panel while a Shorts renderer identity is transitioning
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(panel.hidden, true);
   assert.equal(document.documentElement.classList.contains("fr-youtube-blocked"), true);
+});
+
+test("recovers a server-authorized flexible Shorts lease and blocks at expiry when renewal is unavailable", async () => {
+  const listeners = {};
+  const clock = { value: Date.now() };
+  const leaseExpiresAt = clock.value + 10_000;
+  const player = new FakeBadge("video");
+  player.paused = false;
+  const navigation = { onShorts: true, activeVideoId: "abcdefghijk", player, players: [player], panel: null };
+  const document = makeDocument([], listeners, navigation);
+  let renewalCalls = 0;
+  class FakeDate extends Date { static now() { return clock.value; } }
+  const content = loadContentScript(document, {}, listeners, {
+    status: { ok: true, signedIn: true, email: "member@example.com" },
+    "youtube-pricing-rates": { ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: true },
+    "youtube-balance": { ok: true, coins: 49, shortsExpiresAt: null, serverTime: clock.value },
+    "youtube-entitlement": { ok: true, unlocked: false },
+    "youtube-flexible-state": { ok: true, session: { sessionId: "server-session", status: "active", sequence: 1,
+      leaseExpiresAt, chargedCoins: 0, reservedCoins: 1, availableCoins: 49 }, activeElsewhere: false,
+      rateCoinsPerMinute: 1.6, flexibleUsageEnabled: true, serverTime: clock.value },
+    "youtube-flexible-renew": () => { renewalCalls += 1; return { ok: false, kind: "network", message: "server unavailable" }; },
+  }, { Date: FakeDate });
+  content.setLocation("/shorts/abcdefghijk", "abcdefghijk");
+  listeners["document:yt-navigate-finish"]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(player.paused, false, `playCalls=${player.playCalls ?? 0}, messages=${listeners.messages.map((message) => message.type).join(",")}, status=${navigation.rootClasses.has("fr-youtube-blocked")}`);
+  assert.equal(navigation.rootClasses.has("fr-youtube-blocked"), false);
+  assert.ok(document.body.children.some((node) => node.className === "fr-flexible-usage-status"));
+
+  navigation.activeVideoId = "lmnopqrstuv";
+  content.setLocation("/shorts/lmnopqrstuv", "lmnopqrstuv");
+  listeners["document:yt-navigate-finish"]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(player.paused, false);
+  assert.equal(navigation.rootClasses.has("fr-youtube-blocked"), false);
+
+  const renewalTimer = [...listeners.timeouts.entries()].find(([, callback]) => callback && callback.toString().includes("renewFlexibleSession"));
+  assert.ok(renewalTimer);
+  renewalTimer[1]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renewalCalls, 1);
+  assert.equal(player.paused, false);
+  assert.equal(navigation.rootClasses.has("fr-youtube-blocked"), false);
+
+  clock.value = leaseExpiresAt;
+  const expiryTimers = [...listeners.timeouts.entries()].filter(([id]) => id !== renewalTimer[0]);
+  const expiryTimer = expiryTimers.at(-1)?.[1];
+  assert.equal(typeof expiryTimer, "function");
+  expiryTimer();
+  assert.equal(player.paused, true);
+  assert.equal(navigation.rootClasses.has("fr-youtube-blocked"), true);
 });
 
 test("resumes the purchased standard video immediately only after backend success and not after navigation", async () => {

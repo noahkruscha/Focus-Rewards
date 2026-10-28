@@ -113,6 +113,22 @@
 .fr-youtube-balance:focus-visible, .fr-youtube-brand:focus-visible, .fr-youtube-purchase button:focus-visible { outline: 2px solid #baf0d0 !important; outline-offset: 3px !important; }
 
 .fr-youtube-filtered-short { display: none !important; }
+.fr-flexible-usage-status, .fr-flexible-start, .fr-flexible-stop {
+  position: fixed !important;
+  z-index: 999997 !important;
+  right: 16px !important;
+  max-width: min(360px, calc(100vw - 32px)) !important;
+  padding: 11px 14px !important;
+  border: 1px solid rgba(151,224,187,.28) !important;
+  border-radius: 12px !important;
+  background: rgba(14,18,19,.96) !important;
+  color: #c9f2dc !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,.45) !important;
+  font: 550 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;
+}
+.fr-flexible-usage-status { bottom: 16px !important; }
+.fr-flexible-start, .fr-flexible-stop { bottom: 84px !important; cursor: pointer !important; }
+.fr-flexible-start:disabled, .fr-flexible-stop:disabled { cursor: wait !important; opacity: .65 !important; }
 .fr-youtube-playlist-total {
   margin: 8px 0 !important;
   padding: 10px 14px !important;

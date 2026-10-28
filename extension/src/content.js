@@ -4,6 +4,7 @@
   const SETTING = "youtubePriceIndicatorEnabled";
   const DEFAULT_STANDARD_RATE = 1.2;
   const DEFAULT_SHORTS_RATE = 1.4;
+  const FLEXIBLE_RENEW_LEAD_MS = 2_000;
   const CARD_SELECTOR = "ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, ytd-reel-shelf-renderer";
   const DURATION_SELECTOR = "ytd-thumbnail-overlay-time-status-renderer, yt-thumbnail-badge-view-model";
   const BADGE_CLASS = "fr-youtube-price";
@@ -37,6 +38,9 @@
   let observer;
   let scanTimer = 0;
   let pricingRates = { standardCoinsPerMinute: DEFAULT_STANDARD_RATE, shortsCoinsPerMinute: DEFAULT_SHORTS_RATE, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false };
+  let flexibleState = { status: "idle", sessionId: null, sequence: null, leaseExpiresAt: null, chargedCoins: 0, availableCoins: null, message: "" };
+  let flexibleTimer = 0;
+  let flexibleRequestPending = false;
   const estimateCache = new Map();
   const estimateRequests = new Map();
   let shortsRouteActive = false;
@@ -171,6 +175,11 @@
       && entitlementExpiresAt > serverNow() && entitlementCheckCompletedKey === "youtube_short:account";
   }
 
+  function hasValidFlexibleLease() {
+    return pricingRates.flexibleUsageEnabled === true && flexibleState.status === "active" && Number.isFinite(flexibleState.leaseExpiresAt)
+      && flexibleState.leaseExpiresAt > serverNow() && accountState.signedIn;
+  }
+
   function hasCompletedShortsCheck() {
     return entitlementCheckCompletedKey === "youtube_short:account";
   }
@@ -241,6 +250,264 @@
         else resolve(result ?? { ok: false, kind: "network", error: "NETWORK_ERROR" });
       });
     });
+  }
+
+  function ensureFlexibleStatusPanel() {
+    if (currentContent()?.contentType !== "youtube_short") return;
+    if (pricingRates.flexibleUsageEnabled !== true) {
+      document.querySelectorAll(".fr-flexible-usage-status").forEach((node) => node.remove());
+      return;
+    }
+    let panel = document.querySelector(".fr-flexible-usage-status");
+    if (!panel) {
+      panel = document.createElement("section");
+      panel.className = "fr-flexible-usage-status";
+      panel.setAttribute("role", "status");
+      panel.setAttribute("aria-live", "polite");
+      document.body.append(panel);
+    }
+    const active = flexibleState.status === "active" && Number.isFinite(flexibleState.leaseExpiresAt);
+    panel.textContent = `Flexible Nutzung · ${String(flexibleState.rateCoinsPerMinute ?? pricingRates.flexibleCoinsPerMinute).replace(".", ",")} Coins/min · ${active ? `aktiv · ${Math.max(0, Math.ceil((flexibleState.leaseExpiresAt - serverNow()) / 1000))}s autorisiert` : flexibleState.status} · ${flexibleState.chargedCoins ?? 0} Coins verbraucht · Guthaben ${flexibleState.availableCoins ?? currentBalance ?? "…"}`;
+    if (flexibleState.message) panel.textContent += ` · ${flexibleState.message}`;
+    if (!panel.isConnected) document.body.append(panel);
+  }
+
+  async function syncFlexibleState({ allowCreate = false } = {}) {
+    if (!accountState.signedIn || currentContent()?.contentType !== "youtube_short" || flexibleRequestPending) return;
+    flexibleRequestPending = true;
+    const state = await extensionRequest("youtube-flexible-state");
+    flexibleRequestPending = false;
+    if (!state?.ok) {
+      if (state?.kind === "active-elsewhere") {
+        flexibleState = { ...flexibleState, status: "active-elsewhere", message: "Flexible Sitzung läuft in einem anderen Tab." };
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+        renderPurchaseUi();
+      } else if (state?.kind === "unauthorized") {
+        accountState = { ok: true, signedIn: false };
+        flexibleState = { ...flexibleState, status: "blocked", message: "Sitzung abgelaufen. Bitte Konto erneut verbinden." };
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+        renderPurchaseUi();
+      } else if (state?.kind === "network" && hasValidFlexibleLease()) {
+        flexibleState.status = "blocked";
+        flexibleState.message = "Flexible Sitzung kann nicht bestätigt werden. Verbindung prüfen.";
+        clearFlexibleLeaseTimer();
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+        renderPurchaseUi();
+        ensureFlexibleStatusPanel();
+      } else if (state?.kind === "disabled") {
+        pricingRates.flexibleUsageEnabled = false;
+        flexibleState = { ...flexibleState, status: "disabled", message: "Flexible Nutzung ist für diese Convex-Umgebung deaktiviert." };
+        document.querySelectorAll(".fr-flexible-usage-status").forEach((node) => node.remove());
+      }
+      return;
+    }
+    if (currentContent()?.contentType !== "youtube_short") return;
+    pricingRates.flexibleUsageEnabled = state.flexibleUsageEnabled === true;
+    if (Number.isFinite(state.serverTime)) serverClockOffsetMs = state.serverTime - Date.now();
+    if (state.activeElsewhere) {
+      flexibleState = { ...flexibleState, status: "active-elsewhere", message: "Flexible Sitzung läuft in einem anderen Tab." };
+      document.documentElement.classList.add("fr-youtube-blocked");
+      pauseCurrentPlayer();
+      renderPurchaseUi();
+      return;
+    }
+    flexibleState.rateCoinsPerMinute = state.rateCoinsPerMinute;
+    const session = state.session;
+    if (pricingRates.flexibleUsageEnabled !== true) {
+      if (session?.status === "active" && session.leaseExpiresAt > serverNow()) {
+        flexibleState = { ...flexibleState, ...session, status: "active", leaseExpiresAt: session.leaseExpiresAt };
+        armFlexibleLeaseExpiry(session.leaseExpiresAt);
+      }
+      return;
+    }
+    if (session?.status === "active" && session.leaseExpiresAt > serverNow()) {
+      flexibleState = { ...flexibleState, ...session, status: "active", rateCoinsPerMinute: state.rateCoinsPerMinute, message: "" };
+      entitlementState = "unlocked";
+      entitlementExpiresAt = session.leaseExpiresAt;
+      entitlementCheckCompletedKey = "youtube_short:account";
+      document.documentElement.classList.remove("fr-youtube-blocked");
+      pauseCurrentPlayer(false);
+      const authorizedContent = currentContent();
+      if (authorizedContent?.contentType === "youtube_short") playCurrentPlayer(authorizedContent);
+      document.querySelectorAll(".fr-youtube-purchase").forEach((node) => node.remove());
+      ensureFlexibleStatusPanel();
+      addFlexibleStopControl();
+      armFlexibleLeaseExpiry(session.leaseExpiresAt);
+      return;
+    }
+    flexibleState = { ...flexibleState, status: session?.status || "idle", sessionId: session?.sessionId ?? null,
+      sequence: session?.sequence ?? null, leaseExpiresAt: null, chargedCoins: session?.chargedCoins ?? 0,
+      availableCoins: session?.availableCoins ?? currentBalance, rateCoinsPerMinute: state.rateCoinsPerMinute,
+      message: session?.status === "insufficient" ? "Guthaben reicht nicht für ein weiteres Intervall." : "" };
+    if (allowCreate && !state.session && !state.activeElsewhere) await startFlexibleSession();
+  }
+
+  function addFlexibleSessionControl() {
+    const existing = document.querySelector(".fr-flexible-start");
+    if (existing?.isConnected) return;
+    const control = document.createElement("button");
+    control.className = "fr-flexible-start";
+    control.type = "button";
+    control.textContent = "Flexible Shorts-Nutzung starten";
+    control.setAttribute("aria-label", `Flexible Shorts-Nutzung starten, ${pricingRates.flexibleCoinsPerMinute} Coins pro Minute`);
+    control.addEventListener("click", async () => {
+      control.disabled = true;
+      control.textContent = "Serverautorisierung wird geprüft…";
+      await startFlexibleSession();
+      if (!hasValidFlexibleLease() && control.isConnected) {
+        control.disabled = false;
+        control.textContent = "Flexible Shorts-Nutzung starten";
+      }
+    });
+    document.body.append(control);
+  }
+
+  function addFlexibleStopControl() {
+    document.querySelectorAll(".fr-flexible-start").forEach((node) => node.remove());
+    let control = document.querySelector(".fr-flexible-stop");
+    if (control?.isConnected) return;
+    control = document.createElement("button");
+    control.className = "fr-flexible-stop";
+    control.type = "button";
+    control.textContent = "Flexible Sitzung beenden";
+    control.addEventListener("click", async () => {
+      control.disabled = true;
+      control.textContent = "Sitzung wird abgerechnet…";
+      await stopFlexibleSession();
+      control.remove();
+      if (flexibleState.status !== "stopped") addFlexibleStopControl();
+    });
+    document.body.append(control);
+  }
+
+  async function startFlexibleSession() {
+    if (flexibleRequestPending || currentContent()?.contentType !== "youtube_short") return;
+    flexibleRequestPending = true;
+    const requestedContent = currentContent();
+    const response = await extensionRequest("youtube-flexible-start");
+    flexibleRequestPending = false;
+    await applyFlexibleOperationResult(response, requestedContent);
+  }
+
+  async function renewFlexibleSession() {
+    if (flexibleRequestPending || !hasValidFlexibleLease()) return;
+    flexibleRequestPending = true;
+    const current = currentContent();
+    const response = await extensionRequest("youtube-flexible-renew", { expectedSequence: flexibleState.sequence });
+    flexibleRequestPending = false;
+    await applyFlexibleOperationResult(response, current);
+  }
+
+  async function stopFlexibleSession(message = "") {
+    if (flexibleRequestPending || flexibleState.status !== "active") return;
+    flexibleRequestPending = true;
+    const response = await extensionRequest("youtube-flexible-stop");
+    flexibleRequestPending = false;
+    if (response?.ok) {
+      flexibleState = { ...flexibleState, ...response, status: response.status, message };
+      clearFlexibleLeaseTimer();
+      if (response.status !== "active") {
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      }
+    } else if (response?.kind === "network" || response?.kind === "insufficient-coins" || response?.kind === "unauthorized") {
+      flexibleState.message = response.message || "Flexible Nutzung wurde nicht bestätigt.";
+      document.documentElement.classList.add("fr-youtube-blocked");
+      pauseCurrentPlayer();
+    }
+    ensureFlexibleStatusPanel();
+  }
+
+  async function applyFlexibleOperationResult(response, requestedContent) {
+    const current = currentContent();
+    if (!response?.ok) {
+      const sameAuthorizedShort = current?.contentType === "youtube_short" && requestedContent?.contentType === "youtube_short"
+        && hasValidFlexibleLease();
+      if (sameAuthorizedShort && response?.kind !== "unauthorized" && response?.kind !== "active-elsewhere") {
+        flexibleState.message = response?.message || "Erneuerung nicht bestätigt. Aktuelles autorisiertes Intervall bleibt bis zum Ablauf gültig.";
+        ensureFlexibleStatusPanel();
+        return;
+      }
+      flexibleState.status = response?.kind === "active-elsewhere" ? "active-elsewhere" : "blocked";
+      flexibleState.message = response?.message || "Flexible Abrechnung konnte nicht vom Server bestätigt werden.";
+      if (current?.contentType === "youtube_short") {
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+        renderPurchaseUi();
+      }
+      ensureFlexibleStatusPanel();
+      if (response?.kind === "unauthorized") accountState = { ok: true, signedIn: false };
+      return;
+    }
+    if (Number.isFinite(response.serverTime)) serverClockOffsetMs = response.serverTime - Date.now();
+    flexibleState = { ...flexibleState, ...response, status: response.status,
+      rateCoinsPerMinute: response.rateCoinsPerMinute ?? flexibleState.rateCoinsPerMinute,
+      availableCoins: response.availableCoins ?? currentBalance, message: "" };
+    await refreshBalance();
+    if (response.status === "active" && Number.isFinite(response.leaseExpiresAt) && response.leaseExpiresAt > serverNow()) {
+      if (current?.contentType === "youtube_short" && requestedContent?.contentType === "youtube_short") {
+        entitlementState = "unlocked";
+        entitlementExpiresAt = response.leaseExpiresAt;
+        entitlementCheckCompletedKey = "youtube_short:account";
+        document.documentElement.classList.remove("fr-youtube-blocked");
+        pauseCurrentPlayer(false);
+        playCurrentPlayer(current);
+        document.querySelectorAll(".fr-youtube-purchase").forEach((node) => node.remove());
+        ensureFlexibleStatusPanel();
+        addFlexibleStopControl();
+        armFlexibleLeaseExpiry(response.leaseExpiresAt);
+      } else {
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+      }
+    } else {
+      clearFlexibleLeaseTimer();
+      entitlementState = "blocked";
+      entitlementExpiresAt = null;
+      document.documentElement.classList.add("fr-youtube-blocked");
+      pauseCurrentPlayer();
+      renderPurchaseUi();
+      ensureFlexibleStatusPanel();
+    }
+  }
+
+  function clearFlexibleLeaseTimer() {
+    if (flexibleTimer) window.clearTimeout(flexibleTimer);
+    flexibleTimer = 0;
+  }
+
+  function armFlexibleLeaseExpiry(expiresAt) {
+    clearFlexibleLeaseTimer();
+    const renewAt = expiresAt - FLEXIBLE_RENEW_LEAD_MS;
+    flexibleTimer = window.setTimeout(() => {
+      flexibleTimer = 0;
+      if (currentContent()?.contentType !== "youtube_short") return;
+      if (!hasValidFlexibleLease()) {
+        flexibleState.status = "expired";
+        flexibleState.message = "Intervall abgelaufen. Bitte auf die Serverautorisierung warten.";
+        document.documentElement.classList.add("fr-youtube-blocked");
+        pauseCurrentPlayer();
+        renderPurchaseUi();
+        ensureFlexibleStatusPanel();
+        return;
+      }
+      if (currentContent()?.contentType !== "youtube_short") return;
+      void renewFlexibleSession();
+      if (flexibleTimer) window.clearTimeout(flexibleTimer);
+      flexibleTimer = window.setTimeout(() => {
+        if (flexibleState.status === "active" && Number.isFinite(flexibleState.leaseExpiresAt) && flexibleState.leaseExpiresAt <= serverNow()) {
+          flexibleState.status = "expired";
+          flexibleState.message = "Der Server hat kein weiteres Shorts-Intervall autorisiert.";
+          document.documentElement.classList.add("fr-youtube-blocked");
+          pauseCurrentPlayer();
+          renderPurchaseUi();
+          ensureFlexibleStatusPanel();
+        }
+      }, Math.max(0, expiresAt - serverNow()));
+    }, Math.max(0, renewAt - serverNow()));
   }
 
   function pageContext() {
@@ -328,7 +595,10 @@
     balanceStatus = "ready";
     currentBalance = result.coins;
     currentShortsExpiry = result.shortsExpiresAt;
-    if (currentContent()?.contentType === "youtube_short" && currentShortsExpiry && currentShortsExpiry > serverNow()) {
+    if (currentContent()?.contentType === "youtube_short" && flexibleState.status === "active" && flexibleState.leaseExpiresAt > serverNow()) {
+      currentBalance = result.coins;
+      flexibleState.availableCoins = result.coins;
+    } else if (currentContent()?.contentType === "youtube_short" && currentShortsExpiry && currentShortsExpiry > serverNow()) {
       const content = currentContent();
       if (entitlementState !== "unlocked" || entitlementExpiresAt !== currentShortsExpiry) {
         entitlementState = "unlocked";
@@ -364,7 +634,7 @@
       // renderers, but hide its stale video-specific panel until the next
       // active video ID can be verified.
       document.querySelectorAll(".fr-youtube-purchase").forEach((node) => { node.hidden = true; });
-      if (hasValidShortsGrant()) {
+      if (hasValidShortsGrant() || (pricingRates.flexibleUsageEnabled === true && hasValidFlexibleLease())) {
         document.documentElement.classList.remove("fr-youtube-blocked");
         pauseCurrentPlayer(false);
       } else {
@@ -387,7 +657,7 @@
     const nextContentKey = `${content.contentType}:${content.videoId}`;
     document.querySelectorAll(".fr-youtube-purchase").forEach((node) => { node.hidden = false; });
     if (activeContentKey !== nextContentKey) {
-      const keepShortsAccess = content.contentType === "youtube_short" && hasValidShortsGrant();
+      const keepShortsAccess = content.contentType === "youtube_short" && (hasValidShortsGrant() || (pricingRates.flexibleUsageEnabled === true && hasValidFlexibleLease()));
       const keepShortsDenial = content.contentType === "youtube_short"
         && entitlementState === "blocked" && hasCompletedShortsCheck();
       if (content.contentType !== "youtube_short") stopShortsReminderTimer();
@@ -402,7 +672,7 @@
       } else if (keepShortsAccess) {
         document.documentElement.classList.remove("fr-youtube-blocked");
         pauseCurrentPlayer(false);
-        startShortsReminderTimer();
+        if (hasValidShortsGrant()) startShortsReminderTimer();
       } else if (keepShortsDenial) {
         // The account-wide Shorts check already denied access. Once the new
         // active renderer has an identity, enforce that denial on its player.
@@ -426,6 +696,16 @@
     if (entitlementState === "unlocked" && forceOpen && content.contentType === "youtube_short") shortsPurchasePanelOpen = true;
     const extendingShorts = shortsPurchasePanelOpen && content.contentType === "youtube_short"
       && entitlementState === "unlocked" && entitlementExpiresAt !== null && entitlementExpiresAt > serverNow();
+    if (content.contentType === "youtube_short" && pricingRates.flexibleUsageEnabled === true && hasValidFlexibleLease()) {
+      document.documentElement.classList.remove("fr-youtube-blocked");
+      pauseCurrentPlayer(false);
+      ensureFlexibleStatusPanel();
+      return;
+    }
+    if (content.contentType === "youtube_short" && pricingRates.flexibleUsageEnabled === true && accountState.signedIn
+      && (flexibleState.status === "idle" || flexibleState.status === "insufficient" || flexibleState.status === "stopped")) {
+      addFlexibleSessionControl();
+    }
     if (entitlementState === "unlocked" && !extendingShorts) {
       shortsPurchasePanelOpen = false;
       document.querySelectorAll(".fr-youtube-purchase").forEach((node) => node.remove());
@@ -721,6 +1001,13 @@
       : latestContent?.contentType === content.contentType && latestContent.videoId === content.videoId;
     if (!sameEntitlementScope) return;
     const resolvedContent = latestContent ?? content;
+    if (content.contentType === "youtube_short" && pricingRates.flexibleUsageEnabled === true && hasValidFlexibleLease()) {
+      if (panel?.isConnected) panel.remove();
+      document.documentElement.classList.remove("fr-youtube-blocked");
+      pauseCurrentPlayer(false);
+      if (resolvedContent.contentType === "youtube_short") playCurrentPlayer(resolvedContent);
+      return;
+    }
     if (result.ok && result.unlocked && Number.isFinite(result.expiresAt) && result.expiresAt > (Number.isFinite(result.serverTime) ? result.serverTime : serverNow())) {
       if (Number.isFinite(result.serverTime)) serverClockOffsetMs = result.serverTime - Date.now();
       entitlementState = "unlocked";
@@ -1178,6 +1465,18 @@
           pricingRates = result;
           estimateCache.clear();
           scheduleScan();
+          if (result.flexibleUsageEnabled !== true) {
+            const flexibleLeaseActive = flexibleState.status === "active" && flexibleState.leaseExpiresAt > serverNow();
+            document.querySelectorAll(".fr-flexible-usage-status").forEach((node) => node.remove());
+            if (flexibleLeaseActive) armFlexibleLeaseExpiry(flexibleState.leaseExpiresAt);
+            else if (flexibleState.status === "active") {
+              flexibleState = { ...flexibleState, status: "blocked", message: "Flexible Usage ist serverseitig deaktiviert." };
+              document.documentElement.classList.add("fr-youtube-blocked");
+              pauseCurrentPlayer();
+            }
+          } else if (currentContent()?.contentType === "youtube_short") {
+            void syncFlexibleState();
+          }
         }
       });
     };
@@ -1185,7 +1484,7 @@
       const next = currentContent();
       const onShortsRoute = location.pathname.startsWith("/shorts/");
       const retainShortsDecision = onShortsRoute && hasCompletedShortsCheck();
-      const retainAccountShortsGrant = onShortsRoute && hasValidShortsGrant();
+      const retainAccountShortsGrant = onShortsRoute && (hasValidShortsGrant() || (pricingRates.flexibleUsageEnabled === true && hasValidFlexibleLease()));
       activeContentKey = null;
       if (!onShortsRoute) shortsRendererIdentitySeen = false;
       if (next?.contentType !== "youtube_short" && !retainShortsDecision) {
@@ -1205,6 +1504,7 @@
       renderPurchaseUi();
       refreshPricingRates();
       void refreshBalance();
+      if (next?.contentType === "youtube_short" && accountState.signedIn && !hasValidShortsGrant()) void syncFlexibleState();
     };
     window.addEventListener("popstate", handleNavigation);
     document.addEventListener("yt-navigate-finish", handleNavigation);
@@ -1213,13 +1513,24 @@
       entitlementCheckCompletedKey = null;
       void extensionRequest("status").then((result) => {
         accountState = result;
-        if (result?.signedIn) refreshPricingRates();
+        if (result?.signedIn) {
+          refreshPricingRates();
+          if (currentContent()?.contentType === "youtube_short" && !hasValidShortsGrant()) void syncFlexibleState();
+        }
         void refreshBalance();
         renderPurchaseUi();
       });
     };
     chrome.storage.onChanged.addListener((changes, areaName) => { if (areaName === "local") accountChanged(); });
-    void extensionRequest("status").then((result) => { accountState = result; if (result?.signedIn) refreshPricingRates(); void refreshBalance(); renderPurchaseUi(); });
+    void extensionRequest("status").then((result) => {
+      accountState = result;
+      if (result?.signedIn) {
+        refreshPricingRates();
+        if (currentContent()?.contentType === "youtube_short") void syncFlexibleState();
+      }
+      void refreshBalance();
+      renderPurchaseUi();
+    });
 
     chrome.storage.sync.get({ [SETTING]: true }, (settings) => setEnabled(settings[SETTING]));
     refreshPricingRates();

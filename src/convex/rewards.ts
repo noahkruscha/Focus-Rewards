@@ -4,6 +4,7 @@ import { action, internalMutation, internalQuery, mutation, query } from "./_gen
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { internal } from "./_generated/api";
+import { flexibleCumulativeCharge, flexibleLeaseReservation, FLEXIBLE_LEASE_MS, FLEXIBLE_MAX_RESERVED_COINS, FLEXIBLE_MAX_SESSION_MS, FLEXIBLE_OPERATION_KEY, FLEXIBLE_RECOVERY_GRACE_MS, FLEXIBLE_RECOVERY_TOKEN_HASH, FLEXIBLE_RENEW_LEAD_MS, isFlexibleUsageEnabled } from "./flexibleUsageBilling";
 
 const TASK_REWARD_MAX = 1000;
 const MAX_SESSION_MINUTES = 180;
@@ -379,6 +380,270 @@ export async function purchaseYouTubeEntitlement(ctx: MutationCtx, args: {
   return { success: true as const, alreadyOwned: false, alreadyProcessed: false, price, expiresAt };
 }
 
+async function extensionFlexibleUser(ctx: QueryCtx | MutationCtx, tokenHash: string, now: number) {
+  if (!isFlexibleUsageEnabled()) throw new ConvexError("Flexible usage is disabled.");
+  const credential = await ctx.db.query("extensionSessions").withIndex("by_hash", (q) => q.eq("tokenHash", tokenHash)).unique();
+  if (!credential || credential.revokedAt !== undefined || credential.expiresAt <= now) throw new ConvexError("Extension session is expired or revoked.");
+  const user = await ctx.db.get(credential.userId);
+  if (!user || user.deactivatedAt !== undefined || user.isAnonymous || !hasCompletedProfile(user)) throw new ConvexError("Extension session is expired or revoked.");
+  if (process.env.BETA_REQUIRE_APPROVAL !== "false" && (await accessFor(ctx, credential.userId))?.status !== "approved") throw new ConvexError("Extension session is expired or revoked.");
+  return { userId: credential.userId, user };
+}
+
+async function flexibleSessionView(ctx: QueryCtx | MutationCtx, session: Doc<"flexibleUsageSessions">, now: number) {
+  const account = await requireAccount(ctx, session.userId);
+  return {
+    sessionId: session._id, ownerTabId: session.ownerTabId, ownershipEpoch: session.ownershipEpoch, status: session.status, sequence: session.sequence,
+    latestOperationKey: session.latestOperationKey, stopOperationKey: session.stopOperationKey ?? null,
+    leaseStartedAt: session.leaseStartedAt, leaseExpiresAt: session.leaseExpiresAt,
+    maxExpiresAt: session.maxExpiresAt, authorizedMs: session.authorizedMs,
+    chargedCoins: session.chargedCoins, reservedCoins: session.reservedCoins,
+    availableCoins: account.coins, rateCoinsPerMinute: session.rateCoinsPerMinute, serverTime: now,
+  };
+}
+
+async function settleFlexibleInterval(ctx: MutationCtx, session: Doc<"flexibleUsageSessions">, settleAt: number, reason: "user" | "expired" | "max-duration" | "insufficient") {
+  const interval = await ctx.db.query("flexibleUsageIntervals").withIndex("by_session_sequence", (q) => q.eq("sessionId", session._id).eq("sequence", session.sequence)).unique();
+  if (!interval || interval.status !== "authorized") throw new ConvexError("Flexible interval is not recoverable.");
+  const settledAt = Math.max(interval.startedAt, Math.min(settleAt, interval.expiresAt));
+  const consumedMs = settledAt - interval.startedAt;
+  const totalAuthorizedMs = session.authorizedMs + consumedMs;
+  const totalCharge = flexibleCumulativeCharge(session.rateCoinsPerMinute, totalAuthorizedMs);
+  const charge = totalCharge - session.chargedCoins;
+  if (charge < 0 || charge > interval.reservedCoins) throw new ConvexError("Flexible reservation is inconsistent.");
+  const refund = interval.reservedCoins - charge;
+  if (refund > 0) await recordTransaction(ctx, {
+    userId: session.userId, amount: refund, type: "youtube_flexible_refund",
+    description: "Flexible Shorts unused reservation released", referenceType: "flexible_usage_session",
+    referenceId: String(session._id), idempotencyKey: `flex:release:${session._id}:${session.sequence}`, createdAt: settleAt,
+  });
+  await ctx.db.patch(interval._id, { status: consumedMs > 0 ? "settled" : "released", consumedMs, chargedCoins: charge, refundedCoins: refund, completedAt: settleAt });
+  await ctx.db.patch(session._id, {
+    status: reason === "user" ? "stopped" : reason === "insufficient" ? "insufficient" : "expired",
+    authorizedMs: totalAuthorizedMs, chargedCoins: totalCharge, reservedCoins: 0, stoppedAt: settleAt, stopReason: reason, updatedAt: settleAt,
+  });
+  return await ctx.db.get(session._id);
+}
+
+export const flexibleUsageSessionIdValid = internalQuery({
+  args: { sessionId: v.string() },
+  handler: async (ctx, args) => ctx.db.normalizeId("flexibleUsageSessions", args.sessionId) !== null,
+});
+
+export const flexibleUsageState = internalMutation({
+  args: { tokenHash: v.string(), ownerTabId: v.number() },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const { userId, user } = await extensionFlexibleUser(ctx, args.tokenHash, now);
+    if (!Number.isSafeInteger(args.ownerTabId) || args.ownerTabId < 0) throw new ConvexError("Invalid flexible usage request.");
+    const active = await ctx.db.query("flexibleUsageSessions").withIndex("by_user_status", (q) => q.eq("userId", userId).eq("status", "active")).first();
+    if (active && active.leaseExpiresAt <= now) {
+      await settleFlexibleInterval(ctx, active, active.leaseExpiresAt, now >= active.maxExpiresAt ? "max-duration" : "expired");
+      const settled = (await ctx.db.get(active._id))!;
+      return { session: await flexibleSessionView(ctx, settled, now), activeElsewhere: false,
+        rateCoinsPerMinute: validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES).flexibleCoinsPerMinute,
+        serverTime: now };
+    }
+    const session = active;
+    if (session && session.status === "active" && session.ownerTabId !== args.ownerTabId) {
+      return { session: { sessionId: session._id, ownerTabId: session.ownerTabId, ownershipEpoch: session.ownershipEpoch,
+        latestOperationKey: session.latestOperationKey, status: session.status, sequence: session.sequence, leaseExpiresAt: session.leaseExpiresAt,
+        chargedCoins: session.chargedCoins, reservedCoins: session.reservedCoins }, activeElsewhere: true,
+        rateCoinsPerMinute: validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES).flexibleCoinsPerMinute, serverTime: now };
+    }
+    return {
+      session: session ? await flexibleSessionView(ctx, session, now) : null,
+      activeElsewhere: false,
+      rateCoinsPerMinute: validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES).flexibleCoinsPerMinute,
+      serverTime: now,
+    };
+  },
+});
+
+export const recoverFlexibleUsage = internalMutation({
+  args: { tokenHash: v.string(), ownerTabId: v.number(), sessionId: v.id("flexibleUsageSessions"), expectedEpoch: v.number(), recoveryTokenHash: v.string(), operationKey: v.string() },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const { userId } = await extensionFlexibleUser(ctx, args.tokenHash, now);
+    if (!Number.isSafeInteger(args.ownerTabId) || args.ownerTabId < 0 || !Number.isSafeInteger(args.expectedEpoch)
+      || args.expectedEpoch < 1 || !FLEXIBLE_RECOVERY_TOKEN_HASH.test(args.recoveryTokenHash)
+      || !FLEXIBLE_OPERATION_KEY.test(args.operationKey)) throw new ConvexError("Invalid flexible recovery request.");
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== userId) throw new ConvexError("Flexible session is invalid.");
+    const existing = await ctx.db.query("flexibleUsageRecoveries")
+      .withIndex("by_session_operation", (q) => q.eq("sessionId", session._id).eq("operationKey", args.operationKey)).unique();
+    if (existing) {
+      if (existing.userId !== userId || existing.ownerTabId !== args.ownerTabId || existing.previousEpoch !== args.expectedEpoch) {
+        throw new ConvexError("Flexible recovery key was reused.");
+      }
+      const current = await ctx.db.get(session._id);
+      if (!current || (existing.outcome === "recovered" && (current.ownershipEpoch !== existing.ownershipEpoch || current.ownerTabId !== args.ownerTabId))) throw new ConvexError("Flexible recovery ownership changed again; refresh server state.");
+      return { ...(await flexibleSessionView(ctx, current, now)), recovered: existing.outcome === "recovered" };
+    }
+    if (session.recoveryTokenHash !== args.recoveryTokenHash) throw new ConvexError("Flexible recovery credential is invalid.");
+    if (session.status !== "active") {
+      if (session.status !== "expired" && session.status !== "insufficient") throw new ConvexError("Flexible session is no longer recoverable.");
+      const interval = await ctx.db.query("flexibleUsageIntervals").withIndex("by_session_sequence", (q) => q.eq("sessionId", session._id).eq("sequence", session.sequence)).unique();
+      const outcome = session.status;
+      await ctx.db.insert("flexibleUsageRecoveries", { userId, sessionId: session._id, operationKey: args.operationKey,
+        previousEpoch: args.expectedEpoch, ownershipEpoch: session.ownershipEpoch, previousTabId: session.ownerTabId,
+        ownerTabId: args.ownerTabId, outcome, settledAt: session.stoppedAt ?? session.leaseExpiresAt,
+        authorizedMs: session.authorizedMs, chargedCoins: session.chargedCoins, refundedCoins: interval?.refundedCoins ?? 0, createdAt: now });
+      return { ...(await flexibleSessionView(ctx, session, now)), recovered: false };
+    }
+    if (session.ownershipEpoch !== args.expectedEpoch || session.ownerTabId === args.ownerTabId) {
+      throw new ConvexError("Flexible session ownership changed; refresh server state.");
+    }
+    if (session.leaseExpiresAt <= now) {
+      const interval = await ctx.db.query("flexibleUsageIntervals").withIndex("by_session_sequence", (q) => q.eq("sessionId", session._id).eq("sequence", session.sequence)).unique();
+      if (!interval || interval.status !== "authorized") throw new ConvexError("Flexible interval is not recoverable.");
+      await settleFlexibleInterval(ctx, session, session.leaseExpiresAt, now >= session.maxExpiresAt ? "max-duration" : "expired");
+      const settled = (await ctx.db.get(session._id))!;
+      const settledInterval = (await ctx.db.get(interval._id))!;
+      await ctx.db.insert("flexibleUsageRecoveries", { userId, sessionId: session._id, operationKey: args.operationKey,
+        previousEpoch: args.expectedEpoch, ownershipEpoch: session.ownershipEpoch, previousTabId: session.ownerTabId,
+        ownerTabId: args.ownerTabId, outcome: "expired", settledAt: settled.stoppedAt!, authorizedMs: settled.authorizedMs,
+        chargedCoins: settledInterval.chargedCoins ?? 0, refundedCoins: settledInterval.refundedCoins ?? 0, createdAt: now });
+      return { ...(await flexibleSessionView(ctx, settled, now)), recovered: false };
+    }
+    const previousTabId = session.ownerTabId;
+    const ownershipEpoch = session.ownershipEpoch + 1;
+    await ctx.db.patch(session._id, { ownerTabId: args.ownerTabId, ownershipEpoch, latestOperationKey: args.operationKey, updatedAt: now });
+    await ctx.db.insert("flexibleUsageRecoveries", { userId, sessionId: session._id, operationKey: args.operationKey,
+      previousEpoch: args.expectedEpoch, ownershipEpoch, previousTabId, ownerTabId: args.ownerTabId, outcome: "recovered",
+      settledAt: now, authorizedMs: 0, chargedCoins: 0, refundedCoins: 0, createdAt: now });
+    const recovered = (await ctx.db.get(session._id))!;
+    return { ...(await flexibleSessionView(ctx, recovered, now)), recovered: true };
+  },
+});
+
+export const startFlexibleUsage = internalMutation({
+  args: { tokenHash: v.string(), ownerTabId: v.number(), startKey: v.string(), recoveryTokenHash: v.string(), operationKey: v.string() },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const { userId, user } = await extensionFlexibleUser(ctx, args.tokenHash, now);
+    if (!Number.isSafeInteger(args.ownerTabId) || args.ownerTabId < 0 || !FLEXIBLE_RECOVERY_TOKEN_HASH.test(args.recoveryTokenHash)
+      || !FLEXIBLE_OPERATION_KEY.test(args.startKey) || !FLEXIBLE_OPERATION_KEY.test(args.operationKey)) throw new ConvexError("Invalid flexible usage request.");
+    const previous = await ctx.db.query("flexibleUsageSessions").withIndex("by_user_start_key", (q) => q.eq("userId", userId).eq("startIdempotencyKey", args.startKey)).unique();
+    const operationAlreadyUsed = await ctx.db.query("flexibleUsageIntervals").withIndex("by_user_operation", (q) => q.eq("userId", userId).eq("operationKey", args.operationKey)).unique();
+    if (previous) {
+      if (previous.ownerTabId !== args.ownerTabId || previous.startOperationKey !== args.operationKey || previous.recoveryTokenHash !== args.recoveryTokenHash) throw new ConvexError("Flexible start key was reused.");
+      if (previous.status === "active" && previous.leaseExpiresAt <= now) {
+        await settleFlexibleInterval(ctx, previous, previous.leaseExpiresAt, now >= previous.maxExpiresAt ? "max-duration" : "expired");
+        const settled = (await ctx.db.get(previous._id))!;
+        return { ...(await flexibleSessionView(ctx, settled, now)), resumed: false };
+      }
+      return { ...(await flexibleSessionView(ctx, previous, now)), resumed: previous.status === "active" && previous.leaseExpiresAt > now };
+    }
+    if (operationAlreadyUsed) throw new ConvexError("Flexible operation key was already used.");
+    const active = await ctx.db.query("flexibleUsageSessions").withIndex("by_user_status", (q) => q.eq("userId", userId).eq("status", "active")).first();
+    if (active && active.leaseExpiresAt > now) throw new ConvexError(active.ownerTabId === args.ownerTabId ? "Flexible session already active; recover it." : "Flexible session active in another tab.");
+    if (active) await settleFlexibleInterval(ctx, active, active.leaseExpiresAt, now >= active.maxExpiresAt ? "max-duration" : "expired");
+    const prepaid = await ctx.db.query("shortsAccessSessions").withIndex("by_user", (q) => q.eq("userId", userId)).unique();
+    if (prepaid && prepaid.expiresAt > now) throw new ConvexError("Prepaid Shorts time is already active.");
+    const rates = validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES);
+    if (rates.flexibleCoinsPerMinute > 100) throw new ConvexError("Flexible usage rate is above the supported maximum.");
+    const rate = rates.flexibleCoinsPerMinute;
+    const reserve = flexibleLeaseReservation(rate);
+    if (reserve > FLEXIBLE_MAX_RESERVED_COINS) throw new ConvexError("Flexible interval reservation exceeds the configured maximum.");
+    const account = await requireAccount(ctx, userId);
+    if (account.coins < reserve) throw new ConvexError("INSUFFICIENT_COINS");
+    const expiresAt = Math.min(now + FLEXIBLE_LEASE_MS, now + FLEXIBLE_MAX_SESSION_MS);
+    const sessionId = await ctx.db.insert("flexibleUsageSessions", {
+      userId, ownerTabId: args.ownerTabId, ownershipEpoch: 1, recoveryTokenHash: args.recoveryTokenHash,
+      status: "active", startIdempotencyKey: args.startKey,
+      startOperationKey: args.operationKey, rateCoinsPerMinute: rate, startedAt: now,
+      maxExpiresAt: now + FLEXIBLE_MAX_SESSION_MS, updatedAt: now, sequence: 1,
+      leaseStartedAt: now, leaseExpiresAt: expiresAt, authorizedMs: 0, chargedCoins: 0,
+      reservedCoins: reserve, latestOperationKey: args.operationKey,
+    });
+    await recordTransaction(ctx, { userId, amount: -reserve, type: "youtube_flexible_reservation", description: "Flexible Shorts interval reserved", referenceType: "flexible_usage_session", referenceId: String(sessionId), idempotencyKey: `flex:reserve:${sessionId}:1`, createdAt: now });
+    await ctx.db.insert("flexibleUsageIntervals", { userId, sessionId, sequence: 1, operationKey: args.operationKey, startedAt: now, expiresAt, reservedCoins: reserve, status: "authorized", createdAt: now });
+    await ctx.scheduler.runAfter(expiresAt + FLEXIBLE_RECOVERY_GRACE_MS - now, internal.rewards.expireFlexibleUsage, { sessionId, sequence: 1 });
+    return { ...(await flexibleSessionView(ctx, (await ctx.db.get(sessionId))!, now)), resumed: false };
+  },
+});
+
+export const renewFlexibleUsage = internalMutation({
+  args: { tokenHash: v.string(), ownerTabId: v.number(), sessionId: v.id("flexibleUsageSessions"), expectedSequence: v.number(), ownershipEpoch: v.number(), operationKey: v.string() },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const { userId } = await extensionFlexibleUser(ctx, args.tokenHash, now);
+    if (!Number.isSafeInteger(args.ownerTabId) || !Number.isSafeInteger(args.expectedSequence) || args.expectedSequence < 1
+      || !Number.isSafeInteger(args.ownershipEpoch) || args.ownershipEpoch < 1 || !FLEXIBLE_OPERATION_KEY.test(args.operationKey)) throw new ConvexError("Invalid flexible usage request.");
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== userId || session.ownerTabId !== args.ownerTabId || session.ownershipEpoch !== args.ownershipEpoch) throw new ConvexError("Flexible session ownership is invalid.");
+    const duplicate = await ctx.db.query("flexibleUsageIntervals").withIndex("by_user_operation", (q) => q.eq("userId", userId).eq("operationKey", args.operationKey)).unique();
+    if (duplicate) {
+      if (duplicate.sessionId !== session._id || duplicate.sequence !== args.expectedSequence + 1) throw new ConvexError("Flexible operation key was reused.");
+      const renewed = await ctx.db.get(session._id);
+      if (!renewed || renewed.sequence !== duplicate.sequence || renewed.latestOperationKey !== args.operationKey) throw new ConvexError("Flexible renewal result is no longer active.");
+      return await flexibleSessionView(ctx, renewed, now);
+    }
+    if (session.status !== "active" || session.sequence !== args.expectedSequence || now < session.leaseExpiresAt - FLEXIBLE_RENEW_LEAD_MS || now >= session.leaseExpiresAt) throw new ConvexError("Flexible interval is not ready to renew.");
+    if (session.maxExpiresAt <= session.leaseExpiresAt) {
+      await settleFlexibleInterval(ctx, session, session.leaseExpiresAt, "max-duration");
+      return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+    }
+    const oldInterval = await ctx.db.query("flexibleUsageIntervals").withIndex("by_session_sequence", (q) => q.eq("sessionId", session._id).eq("sequence", session.sequence)).unique();
+    if (!oldInterval || oldInterval.status !== "authorized") throw new ConvexError("Flexible interval cannot be recovered.");
+    const settleAt = oldInterval.expiresAt;
+    const consumedMs = settleAt - oldInterval.startedAt;
+    const authorizedMs = session.authorizedMs + consumedMs;
+    const cumulative = flexibleCumulativeCharge(session.rateCoinsPerMinute, authorizedMs);
+    const charge = cumulative - session.chargedCoins;
+    if (charge < 0 || charge > oldInterval.reservedCoins) throw new ConvexError("Flexible interval reservation is inconsistent.");
+    const refund = oldInterval.reservedCoins - charge;
+    if (refund > 0) await recordTransaction(ctx, { userId, amount: refund, type: "youtube_flexible_refund", description: "Flexible Shorts unused reservation released", referenceType: "flexible_usage_session", referenceId: String(session._id), idempotencyKey: `flex:release:${session._id}:${session.sequence}`, createdAt: settleAt });
+    await ctx.db.patch(oldInterval._id, { status: consumedMs > 0 ? "settled" : "released", consumedMs, chargedCoins: charge, refundedCoins: refund, completedAt: settleAt });
+    const nextStart = oldInterval.expiresAt;
+    const nextExpiry = Math.min(nextStart + FLEXIBLE_LEASE_MS, session.maxExpiresAt);
+    if (nextExpiry <= nextStart) {
+      await ctx.db.patch(session._id, { status: "expired", authorizedMs, chargedCoins: cumulative, reservedCoins: 0, stoppedAt: nextStart, stopReason: "max-duration", updatedAt: nextStart });
+      return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+    }
+    const reserve = flexibleLeaseReservation(session.rateCoinsPerMinute, nextExpiry - nextStart);
+    const account = await requireAccount(ctx, userId);
+    if (account.coins < reserve) {
+      await ctx.db.patch(session._id, { status: "insufficient", authorizedMs, chargedCoins: cumulative, reservedCoins: 0, stoppedAt: settleAt, stopReason: "insufficient", updatedAt: settleAt });
+      return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+    }
+    const sequence = session.sequence + 1;
+    await recordTransaction(ctx, { userId, amount: -reserve, type: "youtube_flexible_reservation", description: "Flexible Shorts interval reserved", referenceType: "flexible_usage_session", referenceId: String(session._id), idempotencyKey: `flex:reserve:${session._id}:${sequence}`, createdAt: nextStart });
+    await ctx.db.patch(session._id, { sequence, leaseStartedAt: nextStart, leaseExpiresAt: nextExpiry, authorizedMs, chargedCoins: cumulative, reservedCoins: reserve, latestOperationKey: args.operationKey, updatedAt: settleAt });
+    await ctx.db.insert("flexibleUsageIntervals", { userId, sessionId: session._id, sequence, operationKey: args.operationKey, startedAt: nextStart, expiresAt: nextExpiry, reservedCoins: reserve, status: "authorized", createdAt: settleAt });
+    await ctx.scheduler.runAfter(nextExpiry + FLEXIBLE_RECOVERY_GRACE_MS - settleAt, internal.rewards.expireFlexibleUsage, { sessionId: session._id, sequence });
+    return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+  },
+});
+
+export const expireFlexibleUsage = internalMutation({
+  args: { sessionId: v.id("flexibleUsageSessions"), sequence: v.number() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    const now = Date.now();
+    if (!session || session.status !== "active" || session.sequence !== args.sequence || session.leaseExpiresAt > now) return null;
+    await settleFlexibleInterval(ctx, session, session.leaseExpiresAt, now >= session.maxExpiresAt ? "max-duration" : "expired");
+    return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+  },
+});
+
+export const stopFlexibleUsage = internalMutation({
+  args: { tokenHash: v.string(), ownerTabId: v.number(), sessionId: v.id("flexibleUsageSessions"), ownershipEpoch: v.number(), operationKey: v.string() },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const { userId } = await extensionFlexibleUser(ctx, args.tokenHash, now);
+    if (!Number.isSafeInteger(args.ownerTabId) || !Number.isSafeInteger(args.ownershipEpoch) || args.ownershipEpoch < 1 || !FLEXIBLE_OPERATION_KEY.test(args.operationKey)) throw new ConvexError("Invalid flexible stop request.");
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== userId || session.ownerTabId !== args.ownerTabId || session.ownershipEpoch !== args.ownershipEpoch) throw new ConvexError("Flexible session ownership is invalid.");
+    if (session.stopOperationKey === args.operationKey) return await flexibleSessionView(ctx, session, now);
+    if (session.stopOperationKey || session.latestOperationKey === args.operationKey) throw new ConvexError("Flexible stop key was reused.");
+    if (session.status === "active") await settleFlexibleInterval(ctx, session, Math.min(now, session.leaseExpiresAt), "user");
+    await ctx.db.patch(session._id, { stopOperationKey: args.operationKey });
+    return await flexibleSessionView(ctx, (await ctx.db.get(session._id))!, now);
+  },
+});
+
 export const extensionYouTubeBalance = internalQuery({
   args: { tokenHash: v.string(), now: v.number() },
   handler: async (ctx, args) => {
@@ -562,6 +827,14 @@ export const purchaseShortsTime = internalMutation({
       return { success: true as const, alreadyProcessed: true, price: -previous.amount, expiresAt: previousGrant.expiresAt };
     }
     if (previousGrant) throw new ConvexError("Shorts purchase could not be reconciled.");
+    const activeFlexible = await ctx.db.query("flexibleUsageSessions")
+      .withIndex("by_user_status", (q) => q.eq("userId", session.userId).eq("status", "active")).first();
+    if (activeFlexible && activeFlexible.leaseExpiresAt <= args.now) {
+      await settleFlexibleInterval(ctx, activeFlexible, activeFlexible.leaseExpiresAt,
+        args.now >= activeFlexible.maxExpiresAt ? "max-duration" : "expired");
+    } else if (activeFlexible) {
+      throw new ConvexError("Flexible Shorts billing is active. Stop that session before purchasing prepaid Shorts time.");
+    }
     const rates = validateYouTubeRates(user.youtubePricingRates ?? DEFAULT_YOUTUBE_RATES);
     const price = youtubePrice(rates.shortsCoinsPerMinute, args.minutes * 60);
     const account = await requireAccount(ctx, session.userId);

@@ -3,6 +3,7 @@ import { ConvexError } from "convex/values";
 import { auth } from "./auth";
 import { internal } from "./_generated/api";
 import { httpAction } from "./_generated/server";
+import { isFlexibleUsageEnabled } from "./flexibleUsageBilling";
 
 const http = httpRouter();
 
@@ -30,7 +31,7 @@ function randomToken(byteLength: number) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function hashExtensionSecret(purpose: "pair" | "session", secret: string) {
+async function hashExtensionSecret(purpose: "pair" | "session" | "flexible-recovery", secret: string) {
   const input = new TextEncoder().encode(`focus-rewards:extension-${purpose}:v1:${secret}`);
   const digest = await crypto.subtle.digest("SHA-256", input);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -129,7 +130,7 @@ http.route({
         tokenHash: authenticated.session.tokenHash,
         now: Date.now(),
       });
-      return jsonResponse({ ...rates, flexibleUsageEnabled: false });
+      return jsonResponse({ ...rates, flexibleUsageEnabled: isFlexibleUsageEnabled() });
     } catch (error) {
       if (error instanceof ConvexError) return jsonResponse({ error: error.message }, error.message.startsWith("Extension session") ? 401 : 400);
       console.error("[extension:youtube-pricing-rates] Unexpected backend failure.");
@@ -239,7 +240,7 @@ http.route({
     if ("error" in authenticated) return authenticated.error;
     try {
       const rates = await ctx.runMutation(internal.rewards.setExtensionYouTubePricingRates, { tokenHash: authenticated.session.tokenHash, expectedStandard: body.expectedStandard, expectedShorts: body.expectedShorts, standardCoinsPerMinute: body.standardCoinsPerMinute, shortsCoinsPerMinute: body.shortsCoinsPerMinute, now: Date.now() });
-      return jsonResponse({ ...rates, flexibleUsageEnabled: false });
+      return jsonResponse({ ...rates, flexibleUsageEnabled: isFlexibleUsageEnabled() });
     } catch (error) {
       if (error instanceof ConvexError) return jsonResponse({ error: error.message }, error.message.startsWith("Extension session") ? 401 : 409);
       console.error("[extension:youtube-pricing-save] Unexpected backend failure.");
@@ -314,6 +315,87 @@ http.route({
     }
   }),
 });
+
+http.route({
+  path: "/extension/youtube/flexible/state",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+http.route({
+  path: "/extension/youtube/flexible/start",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+http.route({
+  path: "/extension/youtube/flexible/renew",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+http.route({
+  path: "/extension/youtube/flexible/stop",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+http.route({
+  path: "/extension/youtube/flexible/recover",
+  method: "OPTIONS",
+  handler: httpAction(async () => new Response(null, { status: 204, headers: extensionCors })),
+});
+
+async function flexibleUsageRequest(ctx: Parameters<Parameters<typeof httpAction>[0]>[0], request: Request, operation: "state" | "start" | "renew" | "stop" | "recover") {
+  if (!isFlexibleUsageEnabled()) return jsonResponse({ error: "Flexible usage is disabled." }, 404);
+  if (!isAllowedExtensionOrigin(request)) return jsonResponse({ error: "Origin not allowed." }, 403);
+  if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) return jsonResponse({ error: "Expected JSON." }, 415);
+  let body: unknown;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "Invalid JSON." }, 400); }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return jsonResponse({ error: "Invalid flexible usage request." }, 400);
+  const data = body as Record<string, unknown>;
+  const hasKey = (key: string) => typeof data[key] === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(data[key] as string);
+  if (!Number.isSafeInteger(data.ownerTabId) || (data.ownerTabId as number) < 0
+    || ((operation === "start" || operation === "renew" || operation === "stop" || operation === "recover") && !hasKey("operationKey"))
+    || (operation === "start" && (!hasKey("startKey") || typeof data.recoveryToken !== "string" || !/^[a-f0-9]{64}$/.test(data.recoveryToken)))
+    || (operation === "renew" && (!Number.isSafeInteger(data.expectedSequence) || (data.expectedSequence as number) < 1
+      || !Number.isSafeInteger(data.ownershipEpoch) || (data.ownershipEpoch as number) < 1 || typeof data.sessionId !== "string"))
+    || (operation === "stop" && (!Number.isSafeInteger(data.ownershipEpoch) || (data.ownershipEpoch as number) < 1 || typeof data.sessionId !== "string"))
+    || (operation === "recover" && typeof data.sessionId !== "string")
+    || (operation === "recover" && (!Number.isSafeInteger(data.expectedEpoch) || (data.expectedEpoch as number) < 1
+      || typeof data.recoveryToken !== "string" || !/^[a-f0-9]{64}$/.test(data.recoveryToken)))) return jsonResponse({ error: "Invalid flexible usage request." }, 400);
+  const authenticated = await authenticatedExtensionSession(ctx, request);
+  if ("error" in authenticated) return authenticated.error;
+  if (operation === "renew" || operation === "stop" || operation === "recover") {
+    const validId = await ctx.runQuery(internal.rewards.flexibleUsageSessionIdValid, { sessionId: data.sessionId as string });
+    if (!validId) return jsonResponse({ error: "Flexible session is invalid." }, 409);
+  }
+  try {
+    const tokenHash = authenticated.session.tokenHash;
+    const result = operation === "state"
+      ? await ctx.runMutation(internal.rewards.flexibleUsageState, { tokenHash, ownerTabId: data.ownerTabId as number })
+      : operation === "start"
+        ? await ctx.runMutation(internal.rewards.startFlexibleUsage, { tokenHash, ownerTabId: data.ownerTabId as number, startKey: data.startKey as string, operationKey: data.operationKey as string, recoveryTokenHash: await hashExtensionSecret("flexible-recovery", data.recoveryToken as string) })
+        : operation === "renew"
+          ? await ctx.runMutation(internal.rewards.renewFlexibleUsage, { tokenHash, ownerTabId: data.ownerTabId as number, sessionId: data.sessionId as import("./_generated/dataModel").Id<"flexibleUsageSessions">, expectedSequence: data.expectedSequence as number, ownershipEpoch: data.ownershipEpoch as number, operationKey: data.operationKey as string })
+          : operation === "stop"
+            ? await ctx.runMutation(internal.rewards.stopFlexibleUsage, { tokenHash, ownerTabId: data.ownerTabId as number, sessionId: data.sessionId as import("./_generated/dataModel").Id<"flexibleUsageSessions">, ownershipEpoch: data.ownershipEpoch as number, operationKey: data.operationKey as string })
+            : await ctx.runMutation(internal.rewards.recoverFlexibleUsage, { tokenHash, ownerTabId: data.ownerTabId as number, sessionId: data.sessionId as import("./_generated/dataModel").Id<"flexibleUsageSessions">, expectedEpoch: data.expectedEpoch as number, recoveryTokenHash: await hashExtensionSecret("flexible-recovery", data.recoveryToken as string), operationKey: data.operationKey as string });
+    return jsonResponse({ ...result, flexibleUsageEnabled: isFlexibleUsageEnabled() });
+  } catch (error) {
+    if (error instanceof ConvexError) {
+      if (error.message === "INSUFFICIENT_COINS") return jsonResponse({ error: "INSUFFICIENT_COINS" }, 402);
+      if (error.message.startsWith("Extension session")) return jsonResponse({ error: error.message }, 401);
+      return jsonResponse({ error: error.message }, 409);
+    }
+    console.error(`[extension:youtube-flexible-${operation}] Unexpected backend failure.`);
+    return jsonResponse({ error: "Flexible Shorts billing is temporarily unavailable." }, 503);
+  }
+}
+
+for (const operation of ["state", "start", "renew", "stop", "recover"] as const) {
+  http.route({
+    path: `/extension/youtube/flexible/${operation}`,
+    method: "POST",
+    handler: httpAction(async (ctx, request) => await flexibleUsageRequest(ctx, request, operation)),
+  });
+}
 
 http.route({
   path: "/extension/youtube/shorts-time",

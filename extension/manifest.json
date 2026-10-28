@@ -14,7 +14,7 @@
       "matches": ["https://www.youtube.com/*"]
     }
   ],
-  "host_permissions": ["https://www.youtube.com/*", "https://*.convex.site/*"],
+  "host_permissions": ["https://www.youtube.com/*", "https://*.convex.site/*", "http://127.0.0.1:3211/*", "http://localhost:3211/*"],
   "background": {
     "service_worker": "src/service-worker.js"
   },
