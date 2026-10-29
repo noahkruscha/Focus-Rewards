@@ -30,14 +30,24 @@ function loadContentScript(document, storage = {}, listeners = {}, responseByTyp
   };
   const chrome = {
     runtime: {
-      lastError: null,
+      get lastError() {
+        if (listeners.invalidateRuntimeContext) throw new Error("Extension context invalidated.");
+        return null;
+      },
       sendMessage(message, callback) {
+        if (listeners.invalidateRuntimeContext) throw new Error("Extension context invalidated.");
         listeners.messages ??= [];
         listeners.messages.push(message);
-        if (message.type in responseByType) callback(typeof responseByType[message.type] === "function" ? responseByType[message.type](message) : responseByType[message.type]);
-        else if (message.type === "youtube-quote") callback({ ok: true, quoteId: "quote-1", price: 12, rateCoinsPerMinute: 1.2, entitlementHours: 18 });
-        else if (message.type === "youtube-pricing-rates") callback({ ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false });
-        else callback({ ok: true, signedIn: false });
+        const respond = () => {
+          if (message.type in responseByType) callback(typeof responseByType[message.type] === "function" ? responseByType[message.type](message) : responseByType[message.type]);
+          else if (message.type === "youtube-quote") callback({ ok: true, quoteId: "quote-1", price: 12, rateCoinsPerMinute: 1.2, entitlementHours: 18 });
+          else if (message.type === "youtube-pricing-rates") callback({ ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false });
+          else callback({ ok: true, signedIn: false });
+        };
+        if (listeners.deferRuntimeCallbacks) {
+          listeners.runtimeCallbacks ??= [];
+          listeners.runtimeCallbacks.push(respond);
+        } else respond();
       },
       getURL(path) { return `chrome-extension://extension-id/${path}`; },
     },
@@ -605,6 +615,27 @@ test("guards late-added Shorts players in an open YouTube shadow root while allo
   player.paused = true;
   player.dispatchEvent("play");
   assert.equal(player.paused, false);
+});
+
+test("fails closed without unhandled rejections when the extension context is invalidated during a pending response", async () => {
+  const listeners = { deferRuntimeCallbacks: true };
+  const document = makeDocument([], listeners, {});
+  loadContentScript(document, {}, listeners, {});
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    listeners["document:yt-navigate-finish"]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(listeners.runtimeCallbacks.length > 0);
+    listeners.invalidateRuntimeContext = true;
+    for (const respond of listeners.runtimeCallbacks.splice(0)) respond();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
 });
 
 test("hides the purchase panel while a Shorts renderer identity is transitioning", async () => {

@@ -245,10 +245,22 @@
 
   function extensionRequest(type, payload = {}) {
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type, ...payload }, (result) => {
-        if (chrome.runtime.lastError) resolve({ ok: false, kind: "network", error: "NETWORK_ERROR" });
-        else resolve(result ?? { ok: false, kind: "network", error: "NETWORK_ERROR" });
-      });
+      const failed = { ok: false, kind: "network", error: "NETWORK_ERROR" };
+      try {
+        chrome.runtime.sendMessage({ type, ...payload }, (result) => {
+          try {
+            // Accessing runtime.lastError can itself throw if the extension was reloaded
+            // while this YouTube document still has its previous content-script context.
+            if (chrome.runtime.lastError) resolve(failed);
+            else resolve(result ?? failed);
+          } catch {
+            resolve(failed);
+          }
+        });
+      } catch {
+        // A stale content script must fail closed rather than leak an unhandled rejection.
+        resolve(failed);
+      }
     });
   }
 

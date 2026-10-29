@@ -12,6 +12,7 @@
   const pricingStatus = document.getElementById("pricing-status");
   let savedRates = null;
   const flexibleRateValue = document.getElementById("flexible-rate-value");
+  const flexibleStatus = document.getElementById("flexible-status");
 
   function openOptions() {
     void chrome.runtime.openOptionsPage();
@@ -25,9 +26,17 @@
 
   function loadRates() {
     chrome.runtime.sendMessage({ type: "youtube-pricing-rates" }).then((result) => {
-      if (!result?.ok) { pricing.hidden = true; return; }
+      if (!result?.ok) {
+        pricing.hidden = true;
+        return;
+      }
       savedRates = { standard: result.standardCoinsPerMinute, shorts: result.shortsCoinsPerMinute };
       flexibleRateValue.value = String(result.flexibleCoinsPerMinute).replace(".", ",");
+      const locallyEnabled = result.flexibleUsageEnabled === true;
+      flexibleStatus.textContent = locallyEnabled
+        ? "Aktiviert nur für diese lokale Convex-Entwicklung."
+        : "Deaktiviert. Für lokalen Test: lokaler Convex-Runtime-Flag und lokale Erweiterungsverbindung erforderlich.";
+      flexibleStatus.dataset.enabled = String(locallyEnabled);
       standardRate.value = String(savedRates.standard);
       shortsRate.value = String(savedRates.shorts);
       document.getElementById("standard-rate-value").value = String(savedRates.standard).replace(".", ",");

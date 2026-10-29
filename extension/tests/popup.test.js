@@ -18,7 +18,7 @@ function element() {
   };
 }
 
-function setup({ status = { ok: true, signedIn: true, email: "member@example.com", expiresAt: Date.now() + 60_000 }, rates = { ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6 }, save = { ok: true, standardCoinsPerMinute: 2, shortsCoinsPerMinute: 3.5, flexibleCoinsPerMinute: 1.6 } } = {}) {
+function setup({ status = { ok: true, signedIn: true, email: "member@example.com", expiresAt: Date.now() + 60_000 }, rates = { ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4, flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false }, save = { ok: true, standardCoinsPerMinute: 2, shortsCoinsPerMinute: 3.5, flexibleCoinsPerMinute: 1.6 } } = {}) {
   const elements = new Map();
   const card = element();
   const pricing = element();
@@ -67,7 +67,22 @@ test("popup loads saved account rates and keeps flexible usage read-only", async
   assert.equal(app.elements.get("standard-rate").value, "1.2");
   assert.equal(app.elements.get("shorts-rate").value, "1.4");
   assert.equal(app.elements.get("flexible-rate-value").value, "1,6");
+  assert.match(app.elements.get("flexible-status").textContent, /Deaktiviert/);
   assert.equal(app.elements.get("save-rates").disabled, true);
+});
+
+test("popup reflects a local server-confirmed Flexible Usage opt-in without changing the production-safe default", async () => {
+  const enabled = setup({ rates: { ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4,
+    flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: true } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(enabled.elements.get("flexible-status").dataset.enabled, "true");
+  assert.match(enabled.elements.get("flexible-status").textContent, /nur für diese lokale Convex-Entwicklung/i);
+
+  const disabled = setup({ rates: { ok: true, standardCoinsPerMinute: 1.2, shortsCoinsPerMinute: 1.4,
+    flexibleCoinsPerMinute: 1.6, flexibleUsageEnabled: false } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disabled.elements.get("flexible-status").dataset.enabled, "false");
+  assert.match(disabled.elements.get("flexible-status").textContent, /Deaktiviert/);
 });
 
 test("popup saves changed standard and Shorts rates only after server confirmation", async () => {
